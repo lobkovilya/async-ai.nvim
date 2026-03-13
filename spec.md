@@ -24,15 +24,11 @@ The primary interaction:
 
 1. **Select a scope** — visual selection. This is the task scope and the hard boundary for any edits.
 2. **Dispatch** — trigger keymap, write a prompt in a minimal input. Hit enter to fire. Non-blocking.
-3. **Lock indicator** — the selected region gets a subtle highlight + gutter sign indicating "AI working here." This is a visual mutex — signals don't edit this region while the task is pending.
-4. **Result arrives** — inline diff appears within the locked region, never outside it. A notification or gutter change signals completion without interrupting cursor position.
-5. **Accept or discard** — single keypress to apply or reject. Lock releases. Buffer returns to normal.
+3. **Task runs async** — you keep editing while the request is in flight. No lock highlight/sign is shown in MVP.
+4. **Result arrives** — if the selected text snapshot is unchanged, the result is auto-applied to that original selected range and nowhere else.
+5. **Stale protection** — if selection content changed while running, apply is aborted and the task is marked stale.
 
-Multiple concurrent tasks on different regions are supported. Each has its own lock and resolves independently.
-
-### Ask Without Editing
-
-For questions and exploration — select a region or leave cursor in place, trigger a "ask" mode. Response appears in a floating window or scratch split. AI does not touch the buffer. Dismiss and return to work.
+Multiple concurrent tasks on different regions are supported. Dispatch is rejected if the new selection overlaps any currently running task.
 
 ---
 
@@ -40,6 +36,7 @@ For questions and exploration — select a region or leave cursor in place, trig
 
 - Apply logic mechanically enforces the boundary — result is spliced into the original selection range, no file-level rewrites.
 - AI never creates new files or touches anything outside the dispatched scope.
+- Before apply, current selection content is compared against the dispatch-time snapshot; mismatch means stale task and no write.
 
 ---
 
@@ -50,11 +47,29 @@ For questions and exploration — select a region or leave cursor in place, trig
 - Pure Lua, Neovim 0.10+
 - HTTP via `vim.system()` + `curl` (no Lua HTTP lib)
 - Async via `vim.schedule()` for buffer-safe callbacks
-- `vim.api.nvim_buf_set_extmark()` for lock highlights and virtual text
+- `vim.notify` for task lifecycle feedback
 
-### Lock Highlight
+### Task Lifecycle
 
-Use a dedicated highlight group (`AiLock`) with a subtle background. Gutter sign (`⟳` pending, `✓` done) via `vim.fn.sign_place`. Virtual text shows elapsed time while pending.
+- `running` — request is in flight
+- `completed_applied` — response received and auto-applied to original selection
+- `stale` — selection content changed since dispatch; response not applied
+- `failed` — request error/invalid response
+- `rejected_overlap` — dispatch denied due to overlap with a running task
+
+### Concurrency Rules
+
+- Multiple tasks can run concurrently as long as their selected ranges do not overlap.
+- New dispatch with overlap is rejected immediately.
+- No per-range visual lock is shown in MVP.
+
+### Notifications
+
+- Dispatch accepted
+- Dispatch rejected (overlap)
+- Task completed and applied
+- Task marked stale (selection changed)
+- Task failed
 
 ---
 
@@ -63,9 +78,5 @@ Use a dedicated highlight group (`AiLock`) with a subtle background. Gutter sign
 | Mode   | Key            | Action                          |
 |--------|----------------|---------------------------------|
 | Visual | `<leader>ai`   | Dispatch inline task            |
-| Visual | `<leader>aq`   | Ask (no edit)                   |
-| Normal | `<leader>aa`   | Accept pending result at cursor |
-| Normal | `<leader>ax`   | Discard pending result at cursor|
-| Normal | `<leader>al`   | List pending tasks (loclist)    |
-
+| Normal | `<leader>al`   | List running tasks              |
 
