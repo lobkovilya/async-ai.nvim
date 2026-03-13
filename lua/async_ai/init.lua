@@ -4,6 +4,11 @@ local state = {
   next_id = 1,
   tasks = {},
   commands_registered = false,
+  ui = {
+    ns = nil,
+    timer = nil,
+    spinner_index = 1,
+  },
 }
 
 local config = {
@@ -16,6 +21,14 @@ local config = {
     enabled = true,
     inline = "<leader>ai",
     list = "<leader>al",
+  },
+  ui = {
+    enabled = true,
+    spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+    update_ms = 120,
+    label_format = "Task %d in progress",
+    range_hl_group = "AsyncAITaskRange",
+    label_hl_group = "AsyncAITaskLabel",
   },
 }
 
@@ -48,6 +61,192 @@ local function split_lines(text)
     return {}
   end
   return vim.split(text, "\n", { plain = true })
+end
+
+local function get_namespace()
+  if not state.ui.ns then
+    state.ui.ns = vim.api.nvim_create_namespace("async_ai")
+  end
+  return state.ui.ns
+end
+
+local function set_default_highlights()
+  if not config.ui or not config.ui.enabled then
+    return
+  end
+
+  vim.api.nvim_set_hl(0, config.ui.range_hl_group, {
+    default = true,
+    bg = "#2a3343",
+  })
+
+  vim.api.nvim_set_hl(0, config.ui.label_hl_group, {
+    default = true,
+    fg = "#7fb7ff",
+    bold = true,
+  })
+end
+
+local function format_task_label(task, frame)
+  local base = string.format(config.ui.label_format, task.id)
+  if frame and frame ~= "" then
+    return frame .. " " .. base
+  end
+  return base
+end
+
+local function upsert_task_label(task, frame)
+  if not config.ui or not config.ui.enabled then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+    return
+  end
+
+  local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, task.range.bufnr, get_namespace(), task.range.start_row, 0, {
+    id = task.ui_label_mark_id,
+    virt_lines = {
+      {
+        { format_task_label(task, frame), config.ui.label_hl_group },
+      },
+    },
+    virt_lines_above = true,
+  })
+
+  if ok then
+    task.ui_label_mark_id = mark_id
+  end
+end
+
+local function clear_task_indicators(task)
+  if not task then
+    return
+  end
+
+  if not config.ui or not config.ui.enabled then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+    return
+  end
+
+  local ns = get_namespace()
+  if task.ui_range_mark_id then
+    pcall(vim.api.nvim_buf_del_extmark, task.range.bufnr, ns, task.ui_range_mark_id)
+    task.ui_range_mark_id = nil
+  end
+
+  if task.ui_label_mark_id then
+    pcall(vim.api.nvim_buf_del_extmark, task.range.bufnr, ns, task.ui_label_mark_id)
+    task.ui_label_mark_id = nil
+  end
+end
+
+local function has_running_tasks()
+  for _, task in pairs(state.tasks) do
+    if task.status == "running" then
+      return true
+    end
+  end
+  return false
+end
+
+local function stop_spinner_timer()
+  if state.ui.timer then
+    state.ui.timer:stop()
+    state.ui.timer:close()
+    state.ui.timer = nil
+  end
+end
+
+local function spinner_frame()
+  local frames = config.ui and config.ui.spinner_frames or nil
+  if type(frames) ~= "table" or #frames == 0 then
+    return ""
+  end
+
+  local index = state.ui.spinner_index
+  if index < 1 or index > #frames then
+    index = 1
+  end
+
+  local frame = frames[index]
+  index = index + 1
+  if index > #frames then
+    index = 1
+  end
+  state.ui.spinner_index = index
+  return frame
+end
+
+local function tick_spinner()
+  if not config.ui or not config.ui.enabled then
+    stop_spinner_timer()
+    return
+  end
+
+  if not has_running_tasks() then
+    stop_spinner_timer()
+    return
+  end
+
+  local frame = spinner_frame()
+  for _, task in pairs(state.tasks) do
+    if task.status == "running" then
+      upsert_task_label(task, frame)
+    end
+  end
+end
+
+local function start_spinner_timer()
+  if not config.ui or not config.ui.enabled then
+    return
+  end
+
+  if state.ui.timer then
+    return
+  end
+
+  local interval = tonumber(config.ui.update_ms) or 120
+  if interval < 50 then
+    interval = 50
+  end
+
+  state.ui.timer = vim.uv.new_timer()
+  state.ui.timer:start(interval, interval, vim.schedule_wrap(tick_spinner))
+end
+
+local function add_task_indicators(task)
+  if not config.ui or not config.ui.enabled then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+    return
+  end
+
+  local ok, range_mark_id = pcall(vim.api.nvim_buf_set_extmark, task.range.bufnr, get_namespace(), task.range.start_row, task.range.start_col, {
+    end_row = task.range.end_row,
+    end_col = task.range.end_col,
+    hl_group = config.ui.range_hl_group,
+    hl_mode = "combine",
+  })
+
+  if ok then
+    task.ui_range_mark_id = range_mark_id
+  end
+
+  upsert_task_label(task, spinner_frame())
+  start_spinner_timer()
+end
+
+local function leave_visual_mode()
+  local mode = vim.fn.mode(1)
+  if mode == "v" or mode == "V" or mode == "\022" then
+    vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+  end
 end
 
 local function get_line(bufnr, row)
@@ -140,7 +339,13 @@ local function extract_anthropic_text(decoded)
 end
 
 local function remove_task(task_id)
+  local task = state.tasks[task_id]
+  clear_task_indicators(task)
   state.tasks[task_id] = nil
+
+  if not has_running_tasks() then
+    stop_spinner_timer()
+  end
 end
 
 local function complete_task(task, generated)
@@ -292,6 +497,8 @@ function M.dispatch_inline_task()
     }
 
     state.tasks[task_id] = task
+    add_task_indicators(task)
+    leave_visual_mode()
     notify("Task " .. task_id .. " dispatched")
     request_task(task)
   end)
@@ -334,6 +541,7 @@ end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
+  set_default_highlights()
 
   if config.keymaps and config.keymaps.enabled then
     vim.keymap.set("x", config.keymaps.inline, M.dispatch_inline_task, {

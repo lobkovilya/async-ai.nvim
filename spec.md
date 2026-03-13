@@ -24,7 +24,7 @@ An AI integration for Neovim where **the developer stays in charge**. AI is invo
 The primary interaction:
 
 1. **Select a scope** — visual selection. This is the task scope and the hard boundary for any edits.
-2. **Dispatch** — trigger keymap, write a prompt in a minimal input. Hit enter to fire. Non-blocking.
+2. **Dispatch** — trigger keymap, write a prompt in a minimal input. Hit enter to fire. Non-blocking. After dispatch is accepted, editor mode returns to Normal mode.
 3. **Task runs async** — you keep editing while the request is in flight. No lock highlight/sign is shown in MVP.
 4. **Result arrives** — if the selected text snapshot is unchanged, the result is auto-applied to that original selected range and nowhere else.
 5. **Stale protection** — if selection content changed while running, apply is aborted and the task is marked stale.
@@ -72,6 +72,27 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 - Task completed and applied
 - Task marked stale (selection changed)
 - Task failed
+
+### In-Progress Visual Indicators
+
+Goal: show active task scope directly in the buffer without harming readability.
+
+- No third-party dependency required; implement with Neovim core APIs (`nvim_buf_set_extmark`, virtual text/lines, timer).
+- While a task is `running`, render a subtle highlight over its scoped range so syntax highlighting remains readable.
+- Render a status label above the scoped region (virtual line above start row), for example: `⠋ Task 3 in progress`.
+- Animate the status indicator with a lightweight spinner (braille or dots), updated on a shared timer.
+- Support multiple concurrent running tasks; each task has independent extmarks and label text.
+- Remove all task visuals immediately when the task reaches terminal state (`completed_applied`, `stale`, `failed`).
+- Leaving Visual mode is part of dispatch UX: once a task is accepted, the visual selection is cleared and editing continues in Normal mode.
+
+Suggested defaults:
+
+- Spinner style: braille frames (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`)
+- Update interval: `120ms`
+- Label format: `Task <id> in progress`
+- Highlight groups (user-overridable):
+  - `AsyncAITaskRange` (subtle background tint)
+  - `AsyncAITaskLabel` (status text color/style)
 
 ---
 
