@@ -3,6 +3,10 @@ local M = {}
 local state = {
   next_id = 1,
   tasks = {},
+  explain_results = {
+    order = {},
+    by_id = {},
+  },
   commands_registered = false,
   ui = {
     ns = nil,
@@ -20,6 +24,8 @@ local config = {
   keymaps = {
     enabled = true,
     inline = "<leader>ai",
+    explain_dispatch = "<leader>ae",
+    explain_open = "<leader>ae",
     list = "<leader>al",
   },
   ui = {
@@ -29,6 +35,14 @@ local config = {
     label_format = "Task %d in progress",
     range_hl_group = "AsyncAITaskRange",
     label_hl_group = "AsyncAITaskLabel",
+  },
+  explain = {
+    window = "float",
+    max_width = 120,
+    max_height = 30,
+    wrap = true,
+    filetype = "markdown",
+    auto_open = false,
   },
 }
 
@@ -61,6 +75,173 @@ local function split_lines(text)
     return {}
   end
   return vim.split(text, "\n", { plain = true })
+end
+
+local function push_explain_result(result)
+  state.explain_results.by_id[result.task_id] = result
+  table.insert(state.explain_results.order, result.task_id)
+end
+
+local function get_latest_explain_result()
+  local order = state.explain_results.order
+  if #order == 0 then
+    return nil
+  end
+  local id = order[#order]
+  return state.explain_results.by_id[id]
+end
+
+local function format_result_title(result)
+  local name = result.bufname
+  if not name or name == "" then
+    name = "[No Name]"
+  else
+    name = vim.fn.fnamemodify(name, ":~:.")
+  end
+  return string.format("Async AI Explain #%d - %s", result.task_id, name)
+end
+
+local function open_result_in_split(result)
+  local lines = split_lines(result.text)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = config.explain.filetype
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  vim.cmd("belowright split")
+  vim.api.nvim_win_set_buf(0, buf)
+  vim.api.nvim_buf_set_name(buf, format_result_title(result))
+end
+
+local function open_result_in_float(result)
+  local lines = split_lines(result.text)
+  local content_width = 0
+  for _, line in ipairs(lines) do
+    content_width = math.max(content_width, vim.fn.strdisplaywidth(line))
+  end
+
+  local max_width = math.max(40, math.min(config.explain.max_width, vim.o.columns - 4))
+  local width = math.max(40, math.min(max_width, content_width + 2))
+  local max_height = math.max(8, math.min(config.explain.max_height, vim.o.lines - 4))
+  local height = math.max(6, math.min(max_height, #lines + 2))
+  local row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = config.explain.filetype
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    style = "minimal",
+    border = "rounded",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    title = format_result_title(result),
+  })
+
+  vim.wo[win].wrap = config.explain.wrap
+
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, silent = true, nowait = true })
+
+  vim.keymap.set("n", "p", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+    open_result_in_split(result)
+  end, { buffer = buf, silent = true, nowait = true })
+
+  vim.keymap.set("n", "y", function()
+    vim.fn.setreg('"', result.text)
+    notify("Explain output yanked")
+  end, { buffer = buf, silent = true, nowait = true })
+end
+
+local function open_explain_result(result)
+  if not result then
+    notify("No explain result to open", vim.log.levels.WARN)
+    return
+  end
+
+  if config.explain.window == "split" then
+    open_result_in_split(result)
+    return
+  end
+
+  open_result_in_float(result)
+end
+
+local function list_explain_result_items()
+  local items = {}
+  for i = #state.explain_results.order, 1, -1 do
+    local id = state.explain_results.order[i]
+    local result = state.explain_results.by_id[id]
+    if result then
+      local name = result.bufname
+      if name == "" then
+        name = "[No Name]"
+      else
+        name = vim.fn.fnamemodify(name, ":~:.")
+      end
+      table.insert(items, {
+        label = string.format("#%d %s", result.task_id, name),
+        result = result,
+      })
+    end
+  end
+  return items
+end
+
+local function open_explain_picker()
+  local items = list_explain_result_items()
+  if #items == 0 then
+    notify("No explain results yet", vim.log.levels.WARN)
+    return
+  end
+
+  local ok_snacks, snacks = pcall(require, "snacks")
+  if ok_snacks and snacks and snacks.picker and snacks.picker.select then
+    local ok_picker = pcall(snacks.picker.select, items, {
+      prompt = "Explain results",
+      format_item = function(item)
+        return item.label
+      end,
+    }, function(item)
+      if item then
+        open_explain_result(item.result)
+      end
+    end)
+
+    if ok_picker then
+      return
+    end
+  end
+
+  vim.ui.select(items, {
+    prompt = "Explain results",
+    format_item = function(item)
+      return item.label
+    end,
+  }, function(item)
+    if item then
+      open_explain_result(item.result)
+    end
+  end)
 end
 
 local function get_namespace()
@@ -338,6 +519,33 @@ local function extract_anthropic_text(decoded)
   return table.concat(chunks, "\n")
 end
 
+local function build_prompt(task)
+  if task.mode == "explain" then
+    return table.concat({
+      "You are explaining a selected code scope from Neovim.",
+      "Respond with a concise, helpful multiline explanation.",
+      "",
+      "Instruction:",
+      task.prompt,
+      "",
+      "Selection:",
+      task.snapshot,
+    }, "\n")
+  end
+
+  return table.concat({
+    "You are editing a scoped selection in Neovim.",
+    "Apply the user's instruction to the provided selection and return only replacement text.",
+    "Do not include markdown fences or explanations.",
+    "",
+    "Instruction:",
+    task.prompt,
+    "",
+    "Selection:",
+    task.snapshot,
+  }, "\n")
+end
+
 local function remove_task(task_id)
   local task = state.tasks[task_id]
   clear_task_indicators(task)
@@ -349,6 +557,24 @@ local function remove_task(task_id)
 end
 
 local function complete_task(task, generated)
+  if task.mode == "explain" then
+    push_explain_result({
+      task_id = task.id,
+      prompt = task.prompt,
+      text = generated,
+      bufnr = task.range.bufnr,
+      bufname = vim.api.nvim_buf_get_name(task.range.bufnr),
+      range = task.range,
+      created_at = os.time(),
+    })
+    remove_task(task.id)
+    notify("Task " .. task.id .. " explanation ready")
+    if config.explain.auto_open then
+      open_explain_result(get_latest_explain_result())
+    end
+    return
+  end
+
   local current_snapshot = range_text(task.range)
   if current_snapshot ~= task.snapshot then
     remove_task(task.id)
@@ -389,17 +615,7 @@ local function request_task(task)
     return
   end
 
-  local prompt = table.concat({
-    "You are editing a scoped selection in Neovim.",
-    "Apply the user's instruction to the provided selection and return only replacement text.",
-    "Do not include markdown fences or explanations.",
-    "",
-    "Instruction:",
-    task.prompt,
-    "",
-    "Selection:",
-    task.snapshot,
-  }, "\n")
+  local prompt = build_prompt(task)
 
   local payload = vim.json.encode({
     model = config.model,
@@ -465,7 +681,7 @@ local function request_task(task)
   end)
 end
 
-function M.dispatch_inline_task()
+local function dispatch_task(mode)
   local bufnr = vim.api.nvim_get_current_buf()
   local range, range_err = normalize_visual_range(bufnr)
   if not range then
@@ -491,6 +707,7 @@ function M.dispatch_inline_task()
     local task = {
       id = task_id,
       status = "running",
+      mode = mode,
       range = range,
       snapshot = range_text(range),
       prompt = user_prompt,
@@ -499,9 +716,21 @@ function M.dispatch_inline_task()
     state.tasks[task_id] = task
     add_task_indicators(task)
     leave_visual_mode()
-    notify("Task " .. task_id .. " dispatched")
+    if mode == "explain" then
+      notify("Task " .. task_id .. " explain dispatched")
+    else
+      notify("Task " .. task_id .. " dispatched")
+    end
     request_task(task)
   end)
+end
+
+function M.dispatch_inline_task()
+  dispatch_task("inline")
+end
+
+function M.dispatch_explain_task()
+  dispatch_task("explain")
 end
 
 function M.list_running_tasks()
@@ -539,6 +768,14 @@ function M.list_running_tasks()
   notify("Running tasks:\n" .. table.concat(lines, "\n"))
 end
 
+function M.open_latest_explain_result()
+  open_explain_result(get_latest_explain_result())
+end
+
+function M.open_explain_result_list()
+  open_explain_picker()
+end
+
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   set_default_highlights()
@@ -546,6 +783,16 @@ function M.setup(opts)
   if config.keymaps and config.keymaps.enabled then
     vim.keymap.set("x", config.keymaps.inline, M.dispatch_inline_task, {
       desc = "async-ai: dispatch inline task",
+      silent = true,
+    })
+
+    vim.keymap.set("x", config.keymaps.explain_dispatch, M.dispatch_explain_task, {
+      desc = "async-ai: dispatch explain task",
+      silent = true,
+    })
+
+    vim.keymap.set("n", config.keymaps.explain_open, M.open_explain_result_list, {
+      desc = "async-ai: open explain result list",
       silent = true,
     })
 
@@ -562,6 +809,19 @@ function M.setup(opts)
 
     vim.api.nvim_create_user_command("AsyncAIList", M.list_running_tasks, {
       desc = "List running async AI tasks",
+    })
+
+    vim.api.nvim_create_user_command("AsyncAIExplain", M.dispatch_explain_task, {
+      desc = "Dispatch explain task for current visual selection",
+      range = true,
+    })
+
+    vim.api.nvim_create_user_command("AsyncAIExplainLast", M.open_latest_explain_result, {
+      desc = "Open latest explain result",
+    })
+
+    vim.api.nvim_create_user_command("AsyncAIExplainList", M.open_explain_result_list, {
+      desc = "Open picker for explain results",
     })
 
     state.commands_registered = true

@@ -101,7 +101,54 @@ Suggested defaults:
 | Mode   | Key            | Action                          |
 |--------|----------------|---------------------------------|
 | Visual | `<leader>ai`   | Dispatch inline task            |
+| Visual | `<leader>ae`   | Explain selected scope (no edit)|
+| Normal | `<leader>ae`   | Open explain result list        |
 | Normal | `<leader>al`   | List running tasks              |
+
+---
+
+## Explain Mode (Non-Modifying Output)
+
+Use case: request an explanation or other generated text about a selected scope without modifying code.
+
+### Behavior
+
+- Explain mode reuses the same visual scope capture and async dispatch model as inline edit tasks.
+- The selected code is sent as context, but no buffer text is replaced on completion.
+- While running, the same in-progress visual indicators are shown on the selected range.
+
+### Output Display (Recommended)
+
+- Do not auto-open output UI when response arrives.
+- On completion, show a notification like: `Task <id> explanation ready`.
+- Persist explain responses in an in-memory task result store.
+- Open output only on explicit user action (pull-based UX), e.g. command or keymap.
+- Recommended reader UI when invoked: scratch floating window (no file, wipe on close) with multiline support.
+- Suggested in-window keymaps:
+  - `q` close window
+  - `p` pin output into a normal split for persistent reading
+  - `y` yank full output text
+
+### Rationale
+
+- Better than notifications for multiline text.
+- Async workflow is preserved: completion never steals focus.
+- Less disruptive than auto-opening a window or split.
+- Keeps explain workflow fast while preserving editing context.
+
+### Suggested Config
+
+- `explain.window = "float"` (default)
+- `explain.max_width`, `explain.max_height`
+- `explain.wrap = true`
+- `explain.filetype = "markdown"`
+- `explain.auto_open = false` (default)
+
+### Accessing Ready Results
+
+- Bind `<leader>ae` in normal mode to open the explain result list.
+- If multiple explain tasks are completed, provide a simple picker/list to choose which result to open (use snacks picker).
+- Keep notification-only behavior for completion; reading is always user-initiated.
 
 ---
 
