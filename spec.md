@@ -13,6 +13,7 @@ An AI integration for Neovim where **the developer stays in charge**. AI is invo
 - **Non-blocking** — dispatching a task never pauses your editing
 - **No dependencies** — direct Anthropic API via curl, no plugin deps
 - **Anthropic-first** — Claude models only, for now
+- **Lazy-compatible loading** — plugin must work when installed/loaded via `lazy.nvim`
 
 ---
 
@@ -48,6 +49,7 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 - HTTP via `vim.system()` + `curl` (no Lua HTTP lib)
 - Async via `vim.schedule()` for buffer-safe callbacks
 - `vim.notify` for task lifecycle feedback
+- Compatible with direct runtimepath loading and `lazy.nvim` plugin loading
 
 ### Task Lifecycle
 
@@ -80,3 +82,14 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 | Visual | `<leader>ai`   | Dispatch inline task            |
 | Normal | `<leader>al`   | List running tasks              |
 
+---
+
+## Validation
+
+- Validate plugin behavior in a normal runtimepath setup.
+- Validate plugin behavior when loaded through `lazy.nvim`.
+- During MVP development, prefer testing via `lazy.nvim` to match real-world usage.
+
+## Developer Workflow Requirement
+
+- Provide a `Makefile` with a target that opens Neovim using the user's `~/.config/nvim` config and also loads the local `async-ai.nvim` plugin from the current working tree.
