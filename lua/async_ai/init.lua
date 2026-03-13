@@ -56,13 +56,23 @@ local function get_line(bufnr, row)
 end
 
 local function normalize_visual_range(bufnr)
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
+  local visual_mode = vim.fn.mode(1)
+  local start_pos
+  local end_pos
+
+  if visual_mode == "v" or visual_mode == "V" or visual_mode == "\022" then
+    start_pos = vim.fn.getpos("v")
+    end_pos = vim.fn.getcurpos()
+  else
+    start_pos = vim.fn.getpos("'<")
+    end_pos = vim.fn.getpos("'>")
+    visual_mode = vim.fn.visualmode()
+  end
+
   if start_pos[2] == 0 or end_pos[2] == 0 then
     return nil, "No active visual selection"
   end
 
-  local visual_mode = vim.fn.visualmode()
   if visual_mode == "\022" then
     return nil, "Block selections are not supported"
   end
