@@ -46,6 +46,17 @@ local config = {
   },
 }
 
+local inline_context_options = {
+  {
+    key = "none",
+    label = "No extra context",
+  },
+  {
+    key = "whole_file",
+    label = "Whole file",
+  },
+}
+
 local function notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = "async-ai.nvim" })
 end
@@ -500,6 +511,25 @@ local function range_text(range)
   return table.concat(text, "\n")
 end
 
+local function buffer_text(bufnr)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  return table.concat(lines, "\n")
+end
+
+local function context_from_option(option, bufnr)
+  local selected = option or inline_context_options[1]
+  local context = {
+    key = selected.key,
+    label = selected.label,
+  }
+
+  if selected.key == "whole_file" then
+    context.text = buffer_text(bufnr)
+  end
+
+  return context
+end
+
 local function extract_anthropic_text(decoded)
   if type(decoded) ~= "table" or type(decoded.content) ~= "table" then
     return nil
@@ -520,7 +550,26 @@ local function extract_anthropic_text(decoded)
 end
 
 local function build_prompt(task)
+  local context = task.context or context_from_option(nil, task.range.bufnr)
+
   if task.mode == "explain" then
+    if context.key == "whole_file" then
+      return table.concat({
+        "You are explaining a selected code scope from Neovim.",
+        "Respond with a concise, helpful multiline explanation.",
+        "Use read-only whole-file context for additional understanding.",
+        "",
+        "Instruction:",
+        task.prompt,
+        "",
+        "Selection:",
+        task.snapshot,
+        "",
+        "Read-only context (whole file):",
+        context.text or "",
+      }, "\n")
+    end
+
     return table.concat({
       "You are explaining a selected code scope from Neovim.",
       "Respond with a concise, helpful multiline explanation.",
@@ -530,6 +579,24 @@ local function build_prompt(task)
       "",
       "Selection:",
       task.snapshot,
+    }, "\n")
+  end
+
+  if context.key == "whole_file" then
+    return table.concat({
+      "You are editing a scoped selection in Neovim.",
+      "Apply the user's instruction to the provided selection and return only replacement text.",
+      "Do not include markdown fences or explanations.",
+      "The whole-file context is read-only and must not be rewritten directly.",
+      "",
+      "Instruction:",
+      task.prompt,
+      "",
+      "Writable selection:",
+      task.snapshot,
+      "",
+      "Read-only context (whole file):",
+      context.text or "",
     }, "\n")
   end
 
@@ -544,6 +611,15 @@ local function build_prompt(task)
     "Selection:",
     task.snapshot,
   }, "\n")
+end
+
+local function selection_overlaps_running_task(range)
+  for _, existing in pairs(state.tasks) do
+    if existing.status == "running" and ranges_overlap(existing.range, range) then
+      return true
+    end
+  end
+  return false
 end
 
 local function remove_task(task_id)
@@ -689,39 +765,58 @@ local function dispatch_task(mode)
     return
   end
 
-  for _, existing in pairs(state.tasks) do
-    if existing.status == "running" and ranges_overlap(existing.range, range) then
-      notify("Dispatch rejected: selection overlaps a running task", vim.log.levels.WARN)
-      return
-    end
+  if selection_overlaps_running_task(range) then
+    notify("Dispatch rejected: selection overlaps a running task", vim.log.levels.WARN)
+    return
   end
 
-  vim.ui.input({ prompt = "AI prompt: " }, function(user_prompt)
-    if not user_prompt or vim.trim(user_prompt) == "" then
+  local function dispatch_with_context(context)
+    vim.ui.input({ prompt = "AI prompt (" .. context.label .. "): " }, function(user_prompt)
+      if not user_prompt or vim.trim(user_prompt) == "" then
+        return
+      end
+
+      if selection_overlaps_running_task(range) then
+        notify("Dispatch rejected: selection overlaps a running task", vim.log.levels.WARN)
+        return
+      end
+
+      local task_id = state.next_id
+      state.next_id = state.next_id + 1
+
+      local task = {
+        id = task_id,
+        status = "running",
+        mode = mode,
+        range = range,
+        snapshot = range_text(range),
+        prompt = user_prompt,
+        context = context,
+      }
+
+      state.tasks[task_id] = task
+      add_task_indicators(task)
+      leave_visual_mode()
+      if mode == "explain" then
+        notify("Task " .. task_id .. " explain dispatched (" .. context.label .. ")")
+      else
+        notify("Task " .. task_id .. " dispatched (" .. context.label .. ")")
+      end
+      request_task(task)
+    end)
+  end
+
+  vim.ui.select(inline_context_options, {
+    prompt = "Context scope",
+    format_item = function(item)
+      return item.label
+    end,
+  }, function(option)
+    if not option then
       return
     end
 
-    local task_id = state.next_id
-    state.next_id = state.next_id + 1
-
-    local task = {
-      id = task_id,
-      status = "running",
-      mode = mode,
-      range = range,
-      snapshot = range_text(range),
-      prompt = user_prompt,
-    }
-
-    state.tasks[task_id] = task
-    add_task_indicators(task)
-    leave_visual_mode()
-    if mode == "explain" then
-      notify("Task " .. task_id .. " explain dispatched")
-    else
-      notify("Task " .. task_id .. " dispatched")
-    end
-    request_task(task)
+    dispatch_with_context(context_from_option(option, bufnr))
   end)
 end
 
