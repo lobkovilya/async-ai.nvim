@@ -16,11 +16,7 @@ local state = {
 }
 
 local config = {
-  api_url = "https://api.anthropic.com/v1/messages",
-  api_key_env = "ANTHROPIC_API_KEY",
-  model = "claude-sonnet-4-6",
-  max_tokens = 1024,
-  temperature = 0,
+  claude_cmd = { "claude", "-p" },
   keymaps = {
     enabled = true,
     inline = "<leader>ai",
@@ -530,25 +526,6 @@ local function context_from_option(option, bufnr)
   return context
 end
 
-local function extract_anthropic_text(decoded)
-  if type(decoded) ~= "table" or type(decoded.content) ~= "table" then
-    return nil
-  end
-
-  local chunks = {}
-  for _, block in ipairs(decoded.content) do
-    if block.type == "text" and type(block.text) == "string" then
-      table.insert(chunks, block.text)
-    end
-  end
-
-  if #chunks == 0 then
-    return nil
-  end
-
-  return table.concat(chunks, "\n")
-end
-
 local function build_prompt(task)
   local context = task.context or context_from_option(nil, task.range.bufnr)
 
@@ -685,74 +662,45 @@ local function fail_task(task, reason)
 end
 
 local function request_task(task)
-  local api_key = vim.env[config.api_key_env]
-  if not api_key or api_key == "" then
-    fail_task(task, "Missing " .. config.api_key_env)
+  if type(config.claude_cmd) ~= "table" or #config.claude_cmd == 0 then
+    fail_task(task, "Invalid claude_cmd config")
+    return
+  end
+
+  local executable = config.claude_cmd[1]
+  if type(executable) ~= "string" or executable == "" then
+    fail_task(task, "Invalid Claude CLI executable")
+    return
+  end
+
+  if vim.fn.executable(executable) ~= 1 then
+    fail_task(task, "Claude CLI not found in $PATH: " .. executable)
     return
   end
 
   local prompt = build_prompt(task)
 
-  local payload = vim.json.encode({
-    model = config.model,
-    max_tokens = config.max_tokens,
-    temperature = config.temperature,
-    messages = {
-      {
-        role = "user",
-        content = {
-          {
-            type = "text",
-            text = prompt,
-          },
-        },
-      },
-    },
-  })
+  local cmd = vim.deepcopy(config.claude_cmd)
+  table.insert(cmd, prompt)
 
-  vim.system({
-    "curl",
-    "-sS",
-    "-X",
-    "POST",
-    config.api_url,
-    "-H",
-    "content-type: application/json",
-    "-H",
-    "x-api-key: " .. api_key,
-    "-H",
-    "anthropic-version: 2023-06-01",
-    "-d",
-    payload,
-  }, { text = true }, function(obj)
+  vim.system(cmd, { text = true }, function(obj)
     vim.schedule(function()
       if not state.tasks[task.id] then
         return
       end
 
       if obj.code ~= 0 then
-        local reason = obj.stderr ~= "" and obj.stderr or ("curl exit code " .. obj.code)
+        local reason = obj.stderr ~= "" and obj.stderr or ("claude exit code " .. obj.code)
         fail_task(task, reason)
         return
       end
 
-      local ok_decode, decoded = pcall(vim.json.decode, obj.stdout)
-      if not ok_decode then
-        fail_task(task, "Invalid JSON response")
+      if not obj.stdout or obj.stdout == "" then
+        fail_task(task, "No text in Claude Code response")
         return
       end
 
-      local text = extract_anthropic_text(decoded)
-      if not text then
-        if decoded.error and decoded.error.message then
-          fail_task(task, decoded.error.message)
-        else
-          fail_task(task, "No text in API response")
-        end
-        return
-      end
-
-      complete_task(task, text)
+      complete_task(task, obj.stdout)
     end)
   end)
 end

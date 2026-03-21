@@ -11,8 +11,8 @@ An AI integration for Neovim where **the developer stays in charge**. AI is invo
 - **You drive, AI assists** — not the other way around
 - **Scoped writes** — AI can only modify the region you explicitly selected
 - **Non-blocking** — dispatching a task never pauses your editing
-- **No dependencies** — direct Anthropic API via curl, no plugin deps
-- **Anthropic-first** — Claude models only, for now
+- **Claude Code transport only** — requests are executed through the local Claude Code CLI
+- **Single provider** — no direct Anthropic HTTP integration in this plugin
 - **Lazy-compatible loading** — plugin must work when installed/loaded via `lazy.nvim`
 
 ---
@@ -53,10 +53,16 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 ### Stack
 
 - Pure Lua, Neovim 0.10+
-- HTTP via `vim.system()` + `curl` (no Lua HTTP lib)
+- Transport via `vim.system()` + Claude Code CLI (`claude`)
 - Async via `vim.schedule()` for buffer-safe callbacks
 - `vim.notify` for task lifecycle feedback
 - Compatible with direct runtimepath loading and `lazy.nvim` plugin loading
+
+### Runtime Requirements
+
+- Claude Code CLI must be installed and available in `$PATH` as `claude`.
+- User must be authenticated with Claude Code before dispatching tasks.
+- Plugin invokes Claude Code per task; no long-running Claude Code instance is required.
 
 ### Task Lifecycle
 
