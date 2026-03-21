@@ -7,6 +7,7 @@ local state = {
     order = {},
     by_id = {},
   },
+  latest_search_result = nil,
   commands_registered = false,
   ui = {
     ns = nil,
@@ -22,6 +23,8 @@ local config = {
     inline = "<leader>ai",
     explain_dispatch = "<leader>ae",
     explain_open = "<leader>ae",
+    search_dispatch = "<leader>as",
+    search_open = "<leader>aq",
     list = "<leader>al",
   },
   ui = {
@@ -312,6 +315,10 @@ local function clear_task_indicators(task)
     return
   end
 
+  if not task.range then
+    return
+  end
+
   if not config.ui or not config.ui.enabled then
     return
   end
@@ -334,7 +341,7 @@ end
 
 local function has_running_tasks()
   for _, task in pairs(state.tasks) do
-    if task.status == "running" then
+    if task.status == "running" and task.range then
       return true
     end
   end
@@ -382,7 +389,7 @@ local function tick_spinner()
 
   local frame = spinner_frame()
   for _, task in pairs(state.tasks) do
-    if task.status == "running" then
+    if task.status == "running" and task.range then
       upsert_task_label(task, frame)
     end
   end
@@ -527,6 +534,26 @@ local function context_from_option(option, bufnr)
 end
 
 local function build_prompt(task)
+  if task.mode == "search" then
+    return table.concat({
+      "You are a codebase search agent running inside Neovim via Claude Code CLI.",
+      "Investigate the repository using as many steps/commands as needed.",
+      "Return search hits only, as strict JSON with no markdown.",
+      "Output format:",
+      '{"results":[{"filename":"path/to/file","lnum":12,"col":3,"text":"matching context"}]}',
+      "Rules:",
+      "- filename must be repository-relative when possible.",
+      "- lnum must be 1-based integer.",
+      "- col is optional; default to 1 when unknown.",
+      "- text should be a short single-line summary of why this hit is relevant.",
+      "- If no matches, return: {\"results\":[]}",
+      "- Do not include commentary before or after JSON.",
+      "",
+      "Search request:",
+      task.prompt,
+    }, "\n")
+  end
+
   local context = task.context or context_from_option(nil, task.range.bufnr)
 
   if task.mode == "explain" then
@@ -609,7 +636,88 @@ local function remove_task(task_id)
   end
 end
 
+local function decode_json_maybe_fenced(text)
+  local trimmed = vim.trim(text or "")
+  if trimmed == "" then
+    return nil
+  end
+
+  local ok, decoded = pcall(vim.json.decode, trimmed)
+  if ok then
+    return decoded
+  end
+
+  local unfenced = trimmed:gsub("^```[%w_-]*\n", ""):gsub("\n```$", "")
+  if unfenced ~= trimmed then
+    local ok_fenced, decoded_fenced = pcall(vim.json.decode, unfenced)
+    if ok_fenced then
+      return decoded_fenced
+    end
+  end
+
+  return nil
+end
+
+local function parse_search_results(generated)
+  local decoded = decode_json_maybe_fenced(generated)
+  if type(decoded) ~= "table" then
+    return nil, "invalid JSON"
+  end
+
+  local rows = decoded.results or decoded
+  if type(rows) ~= "table" then
+    return nil, "missing results array"
+  end
+
+  local items = {}
+  for _, row in ipairs(rows) do
+    if type(row) == "table" then
+      local filename = row.filename or row.path or row.file
+      local lnum = tonumber(row.lnum or row.line)
+      if type(filename) == "string" and filename ~= "" and lnum and lnum >= 1 then
+        local col = tonumber(row.col) or 1
+        if col < 1 then
+          col = 1
+        end
+
+        local text = row.text or row.message or ""
+        if type(text) ~= "string" then
+          text = tostring(text)
+        end
+        text = vim.trim(text:gsub("\n", " "))
+
+        table.insert(items, {
+          filename = filename,
+          lnum = math.floor(lnum),
+          col = math.floor(col),
+          text = text,
+        })
+      end
+    end
+  end
+
+  return items
+end
+
 local function complete_task(task, generated)
+  if task.mode == "search" then
+    local items, parse_err = parse_search_results(generated)
+    if not items then
+      fail_task(task, "Invalid search response: " .. parse_err)
+      return
+    end
+
+    state.latest_search_result = {
+      task_id = task.id,
+      prompt = task.prompt,
+      items = items,
+      created_at = os.time(),
+    }
+    remove_task(task.id)
+    notify("Search " .. task.id .. " results ready")
+    return
+  end
+
   if task.mode == "explain" then
     push_explain_result({
       task_id = task.id,
@@ -776,29 +884,71 @@ function M.dispatch_explain_task()
   dispatch_task("explain")
 end
 
+function M.dispatch_search_task()
+  vim.ui.input({ prompt = "Search prompt: " }, function(user_prompt)
+    if not user_prompt or vim.trim(user_prompt) == "" then
+      return
+    end
+
+    local task_id = state.next_id
+    state.next_id = state.next_id + 1
+
+    local task = {
+      id = task_id,
+      status = "running",
+      mode = "search",
+      prompt = user_prompt,
+    }
+
+    state.tasks[task_id] = task
+    notify("Search " .. task_id .. " dispatched")
+    request_task(task)
+  end)
+end
+
+function M.open_latest_search_quickfix()
+  local latest = state.latest_search_result
+  if not latest then
+    notify("No search results yet", vim.log.levels.WARN)
+    return
+  end
+
+  vim.fn.setqflist({}, " ", {
+    title = string.format("Async AI Search #%d", latest.task_id),
+    items = latest.items,
+  })
+  vim.cmd("copen")
+end
+
 function M.list_running_tasks()
   local lines = {}
   for id, task in pairs(state.tasks) do
     if task.status == "running" then
-      local name = vim.api.nvim_buf_get_name(task.range.bufnr)
-      if name == "" then
-        name = "[No Name]"
-      else
-        name = vim.fn.fnamemodify(name, ":~:.")
-      end
+      if task.mode == "search" then
+        table.insert(lines, string.format("#%d [search] %s", id, task.prompt))
+      elseif task.range then
+        local name = vim.api.nvim_buf_get_name(task.range.bufnr)
+        if name == "" then
+          name = "[No Name]"
+        else
+          name = vim.fn.fnamemodify(name, ":~:.")
+        end
 
-      table.insert(
-        lines,
-        string.format(
-          "#%d %s (%d:%d -> %d:%d)",
-          id,
-          name,
-          task.range.start_row + 1,
-          task.range.start_col + 1,
-          task.range.end_row + 1,
-          task.range.end_col + 1
+        table.insert(
+          lines,
+          string.format(
+            "#%d %s (%d:%d -> %d:%d)",
+            id,
+            name,
+            task.range.start_row + 1,
+            task.range.start_col + 1,
+            task.range.end_row + 1,
+            task.range.end_col + 1
+          )
         )
-      )
+      else
+        table.insert(lines, string.format("#%d [task] running", id))
+      end
     end
   end
 
@@ -839,6 +989,16 @@ function M.setup(opts)
       silent = true,
     })
 
+    vim.keymap.set("n", config.keymaps.search_dispatch, M.dispatch_search_task, {
+      desc = "async-ai: dispatch search task",
+      silent = true,
+    })
+
+    vim.keymap.set("n", config.keymaps.search_open, M.open_latest_search_quickfix, {
+      desc = "async-ai: open latest search quickfix",
+      silent = true,
+    })
+
     vim.keymap.set("n", config.keymaps.list, M.list_running_tasks, {
       desc = "async-ai: list running tasks",
       silent = true,
@@ -865,6 +1025,14 @@ function M.setup(opts)
 
     vim.api.nvim_create_user_command("AsyncAIExplainList", M.open_explain_result_list, {
       desc = "Open picker for explain results",
+    })
+
+    vim.api.nvim_create_user_command("AsyncAISearch", M.dispatch_search_task, {
+      desc = "Dispatch async AI search task",
+    })
+
+    vim.api.nvim_create_user_command("AsyncAISearchQuickfix", M.open_latest_search_quickfix, {
+      desc = "Open latest async AI search results in quickfix",
     })
 
     state.commands_registered = true

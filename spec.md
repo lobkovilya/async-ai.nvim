@@ -38,6 +38,18 @@ The chosen context scope must be visible in dispatch notifications/messages.
 
 Multiple concurrent tasks on different regions are supported. Dispatch is rejected if the new selection overlaps any currently running task.
 
+### Agentic Search Task
+
+Use case: ask Claude Code to investigate the codebase and return actionable search hits, not just a single generated `rg` command.
+
+1. **Open prompt** — trigger `<leader>as` in Normal mode.
+2. **Dispatch** — enter a natural-language search goal (for example: `find all places where task stale logic is handled`).
+3. **Task runs async** — Claude Code performs multi-step repository search autonomously (can run multiple commands/tools) and compiles normalized matches.
+4. **Ready notification** — when complete, show `Search <id> results ready`.
+5. **Open latest results** — trigger `<leader>aq` to populate and open quickfix with the latest completed search results.
+
+Search is non-modifying: it never writes to buffers/files and never applies inline edits.
+
 ---
 
 ## Scope Enforcement
@@ -68,6 +80,7 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 
 - `running` — request is in flight
 - `completed_applied` — response received and auto-applied to original selection
+- `completed_search_ready` — search response parsed and stored as latest quickfix payload
 - `stale` — selection content changed since dispatch; response not applied
 - `failed` — request error/invalid response
 - `rejected_overlap` — dispatch denied due to overlap with a running task
@@ -83,6 +96,7 @@ Multiple concurrent tasks on different regions are supported. Dispatch is reject
 - Dispatch accepted (must include chosen context scope)
 - Dispatch rejected (overlap)
 - Task completed and applied
+- Search results ready
 - Task marked stale (selection changed)
 - Task failed
 
@@ -115,8 +129,34 @@ Suggested defaults:
 |--------|----------------|---------------------------------|
 | Visual | `<leader>ai`   | Open context picker, then dispatch inline task |
 | Visual | `<leader>ae`   | Explain selected scope (no edit)|
+| Normal | `<leader>as`   | Open agentic search prompt and dispatch async search |
+| Normal | `<leader>aq`   | Open quickfix with latest search results |
 | Normal | `<leader>ae`   | Open explain result list        |
 | Normal | `<leader>al`   | List running tasks              |
+
+---
+
+## Search Mode (Agentic, Quickfix Output)
+
+### Behavior
+
+- Search dispatch is initiated from Normal mode via `<leader>as`.
+- Prompt is free-form natural language; no visual selection is required.
+- Claude Code is expected to run a proper investigative flow (multiple commands/steps as needed), then return structured hits.
+- Plugin converts hits into quickfix entries (`filename`, `lnum`, optional `col`, `text`) and stores them in an in-memory latest-search slot.
+- On completion, only a notification is shown; quickfix does not auto-open.
+
+### Output Access
+
+- `<leader>aq` opens quickfix populated with the latest completed search.
+- If no completed search exists yet, show a warning notification.
+- Opening quickfix is pull-based so it never steals focus when a task completes.
+
+### Rationale
+
+- Claude Code as an agent can produce substantially better search outcomes than one-shot command generation.
+- Async notification + pull-based quickfix keeps editing flow uninterrupted.
+- Quickfix provides native jump/navigation UX for search-driven code exploration.
 
 ---
 
