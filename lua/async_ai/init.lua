@@ -3,6 +3,8 @@ local M = {}
 local state = {
   next_id = 1,
   tasks = {},
+  task_history_order = {},
+  task_history_by_id = {},
   explain_results = {
     order = {},
     by_id = {},
@@ -25,7 +27,11 @@ local config = {
     explain_open = "<leader>ae",
     search_dispatch = "<leader>as",
     search_open = "<leader>aq",
-    list = "<leader>al",
+    list = nil,
+    task_browser = {
+      ["<leader>al"] = { "COMPLETED", "UNREAD" },
+      ["<leader>aa"] = {},
+    },
   },
   ui = {
     enabled = true,
@@ -43,6 +49,9 @@ local config = {
     filetype = "markdown",
     auto_open = false,
   },
+  task_browser = {
+    history_limit = 200,
+  },
 }
 
 local inline_context_options = {
@@ -55,6 +64,35 @@ local inline_context_options = {
     label = "Whole file",
   },
 }
+
+local filter_order = { "COMPLETED", "INPROGRESS", "UNREAD", "SEARCH", "EXPLAIN", "EDIT" }
+
+local success_statuses = {
+  completed_applied = true,
+  completed_explain_ready = true,
+  completed_search_ready = true,
+}
+
+local terminal_statuses = {
+  completed_applied = true,
+  completed_explain_ready = true,
+  completed_search_ready = true,
+  stale = true,
+  failed = true,
+  cancelled = true,
+}
+
+local cancel_running_task
+
+local function task_kind(mode)
+  if mode == "search" then
+    return "SEARCH"
+  end
+  if mode == "explain" then
+    return "EXPLAIN"
+  end
+  return "EDIT"
+end
 
 local function notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = "async-ai.nvim" })
@@ -99,6 +137,68 @@ local function get_latest_explain_result()
   end
   local id = order[#order]
   return state.explain_results.by_id[id]
+end
+
+local function history_limit()
+  local value = tonumber(config.task_browser and config.task_browser.history_limit) or 200
+  if value < 1 then
+    value = 1
+  end
+  return math.floor(value)
+end
+
+local function trim_task_history()
+  local limit = history_limit()
+  while #state.task_history_order > limit do
+    local oldest_id = table.remove(state.task_history_order, 1)
+    state.task_history_by_id[oldest_id] = nil
+  end
+end
+
+local function ensure_task_history(task)
+  local existing = state.task_history_by_id[task.id]
+  if existing then
+    return existing
+  end
+
+  local bufnr = nil
+  local bufname = nil
+  if task.range and task.range.bufnr and vim.api.nvim_buf_is_valid(task.range.bufnr) then
+    bufnr = task.range.bufnr
+    bufname = vim.api.nvim_buf_get_name(task.range.bufnr)
+  end
+
+  local entry = {
+    id = task.id,
+    mode = task.mode,
+    kind = task_kind(task.mode),
+    prompt = task.prompt,
+    status = task.status or "running",
+    created_at = os.time(),
+    updated_at = os.time(),
+    read = false,
+    bufnr = bufnr,
+    bufname = bufname,
+    range = task.range,
+    snapshot = task.snapshot,
+  }
+  state.task_history_by_id[task.id] = entry
+  table.insert(state.task_history_order, task.id)
+  trim_task_history()
+  return entry
+end
+
+local function update_task_history(task, patch)
+  local entry = ensure_task_history(task)
+  for key, value in pairs(patch or {}) do
+    entry[key] = value
+  end
+  entry.updated_at = os.time()
+  return entry
+end
+
+local function history_entry(task_id)
+  return state.task_history_by_id[task_id]
 end
 
 local function format_result_title(result)
@@ -252,6 +352,327 @@ local function open_explain_picker()
       open_explain_result(item.result)
     end
   end)
+end
+
+local function make_filter_set(filters)
+  local set = {}
+  for _, key in ipairs(filters or {}) do
+    if type(key) == "string" and key ~= "" then
+      set[key] = true
+    end
+  end
+  return set
+end
+
+local function is_unread(entry)
+  if entry.status == "running" then
+    return true
+  end
+  return not entry.read
+end
+
+local function matches_unread_filter(entry)
+  if entry.status == "running" then
+    return false
+  end
+  return not entry.read
+end
+
+local function matches_filters(entry, active)
+  local any = false
+  for _ in pairs(active) do
+    any = true
+    break
+  end
+
+  if not any then
+    return true
+  end
+
+  local status_match = true
+  local has_status_filter = active.COMPLETED or active.INPROGRESS or active.UNREAD
+  if has_status_filter then
+    status_match = false
+    if active.COMPLETED and success_statuses[entry.status] then
+      status_match = true
+    end
+    if active.INPROGRESS and entry.status == "running" then
+      status_match = true
+    end
+    if active.UNREAD and matches_unread_filter(entry) then
+      status_match = true
+    end
+  end
+
+  local type_match = true
+  local has_type_filter = active.SEARCH or active.EXPLAIN or active.EDIT
+  if has_type_filter then
+    type_match = active[entry.kind] == true
+  end
+
+  return status_match and type_match
+end
+
+local function status_badge(entry)
+  if entry.status == "running" then
+    return "INPROGRESS"
+  end
+  if success_statuses[entry.status] then
+    return "COMPLETED"
+  end
+  return string.upper(entry.status)
+end
+
+local function build_task_browser_rows(active)
+  local rows = {}
+  for i = #state.task_history_order, 1, -1 do
+    local id = state.task_history_order[i]
+    local entry = state.task_history_by_id[id]
+    if entry and matches_filters(entry, active) then
+      local short_prompt = vim.trim(entry.prompt or "")
+      if #short_prompt > 70 then
+        short_prompt = short_prompt:sub(1, 67) .. "..."
+      end
+      local unread_badge = is_unread(entry) and " UNREAD" or ""
+      local text = string.format("#%d %-9s %-10s%s %s", entry.id, entry.kind, status_badge(entry), unread_badge, short_prompt)
+      table.insert(rows, {
+        text = text,
+        entry = entry,
+      })
+    end
+  end
+  return rows
+end
+
+local function filters_text(active)
+  local chips = {}
+  for _, name in ipairs(filter_order) do
+    if active[name] then
+      table.insert(chips, "[" .. name .. "]")
+    end
+  end
+  if #chips == 0 then
+    return "[ALL]"
+  end
+  return table.concat(chips, " ")
+end
+
+local function open_text_result(title, text, filetype)
+  local lines = split_lines(text or "")
+  local content_width = 0
+  for _, line in ipairs(lines) do
+    content_width = math.max(content_width, vim.fn.strdisplaywidth(line))
+  end
+
+  local width = math.max(50, math.min(vim.o.columns - 4, content_width + 4))
+  local height = math.max(8, math.min(vim.o.lines - 4, #lines + 2))
+  local row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1)
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = filetype or "markdown"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    style = "minimal",
+    border = "rounded",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    title = title,
+  })
+
+  vim.wo[win].wrap = true
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, silent = true, nowait = true })
+end
+
+local function open_edit_result(entry)
+  local before = entry.snapshot or ""
+  local after = entry.generated or ""
+  local text = nil
+  if vim.diff then
+    text = vim.diff(before, after, { result_type = "unified", ctxlen = 3 })
+  end
+  if not text or text == "" then
+    text = table.concat({
+      "Instruction:",
+      entry.prompt or "",
+      "",
+      "Result:",
+      after,
+    }, "\n")
+  end
+
+  open_text_result(string.format("Async AI Edit #%d", entry.id), text, "diff")
+end
+
+local function open_search_result(entry)
+  local items = entry.search_items or {}
+  vim.fn.setqflist({}, " ", {
+    title = string.format("Async AI Search #%d", entry.id),
+    items = items,
+  })
+  vim.cmd("copen")
+end
+
+local function mark_entry_read(entry)
+  if not entry then
+    return
+  end
+  entry.read = true
+  entry.updated_at = os.time()
+end
+
+local function open_task_history_entry(entry)
+  if not entry then
+    return false
+  end
+
+  if entry.status == "running" then
+    return false
+  end
+
+  mark_entry_read(entry)
+
+  if entry.kind == "EXPLAIN" and success_statuses[entry.status] then
+    local result = {
+      task_id = entry.id,
+      text = entry.explain_text or entry.generated or "",
+      bufnr = entry.bufnr,
+      bufname = entry.bufname,
+      range = entry.range,
+    }
+    open_explain_result(result)
+    return true
+  end
+
+  if entry.kind == "SEARCH" and success_statuses[entry.status] then
+    open_search_result(entry)
+    return true
+  end
+
+  if entry.kind == "EDIT" and success_statuses[entry.status] then
+    open_edit_result(entry)
+    return true
+  end
+
+  local message = entry.error or ("Task status: " .. entry.status)
+  notify("Task " .. entry.id .. ": " .. message, vim.log.levels.WARN)
+  return false
+end
+
+local function open_task_browser(default_filters)
+  local ok_snacks, snacks = pcall(require, "snacks")
+  if not ok_snacks or not snacks or not snacks.picker then
+    notify("snacks.nvim is required for task browser", vim.log.levels.ERROR)
+    return
+  end
+
+  local picker_state = {
+    active = make_filter_set(default_filters),
+  }
+
+  local function finder()
+    return build_task_browser_rows(picker_state.active)
+  end
+
+  local function refresh(picker)
+    picker.title = "Async AI Tasks " .. filters_text(picker_state.active)
+    picker:update_titles()
+    picker:find({ refresh = true })
+  end
+
+  local function toggle(name)
+    return function(picker)
+      picker_state.active[name] = not picker_state.active[name]
+      refresh(picker)
+    end
+  end
+
+  local function clear_all(picker)
+    picker_state.active = {}
+    refresh(picker)
+  end
+
+  local function cancel_selected(picker)
+    local item = picker:current()
+    local entry = item and item.entry or nil
+    if not entry or entry.status ~= "running" then
+      return
+    end
+
+    vim.ui.select({ "No", "Yes" }, { prompt = string.format("Cancel task #%d?", entry.id) }, function(choice)
+      if choice ~= "Yes" then
+        return
+      end
+
+      local task = state.tasks[entry.id]
+      if task and task.status == "running" then
+        cancel_running_task(task)
+      end
+      refresh(picker)
+    end)
+  end
+
+  local function confirm_entry(picker, item)
+    local row = item or picker:current()
+    if not row or not row.entry then
+      return
+    end
+
+    local opened = open_task_history_entry(row.entry)
+    if opened then
+      picker:close()
+      return
+    end
+
+    refresh(picker)
+  end
+
+  snacks.picker({
+    title = "Async AI Tasks " .. filters_text(picker_state.active),
+    focus = "list",
+    finder = finder,
+    format = "text",
+    preview = "none",
+    layout = { preset = "select" },
+    confirm = confirm_entry,
+    actions = {
+      toggle_completed = toggle("COMPLETED"),
+      toggle_inprogress = toggle("INPROGRESS"),
+      toggle_unread = toggle("UNREAD"),
+      toggle_search = toggle("SEARCH"),
+      toggle_explain = toggle("EXPLAIN"),
+      toggle_edit = toggle("EDIT"),
+      clear_filters = clear_all,
+      cancel_task = cancel_selected,
+    },
+    win = {
+      list = {
+        keys = {
+          ["c"] = "toggle_completed",
+          ["i"] = "toggle_inprogress",
+          ["u"] = "toggle_unread",
+          ["s"] = "toggle_search",
+          ["e"] = "toggle_explain",
+          ["d"] = "toggle_edit",
+          ["0"] = "clear_filters",
+          ["x"] = "cancel_task",
+        },
+      },
+    },
+  })
 end
 
 local function get_namespace()
@@ -706,6 +1127,9 @@ end
 
 local function remove_task(task_id)
   local task = state.tasks[task_id]
+  if task then
+    task.proc = nil
+  end
   clear_task_indicators(task)
   state.tasks[task_id] = nil
 
@@ -791,6 +1215,12 @@ local function complete_task(task, generated)
       items = items,
       created_at = os.time(),
     }
+    update_task_history(task, {
+      status = "completed_search_ready",
+      read = false,
+      search_items = items,
+      generated = generated,
+    })
     remove_task(task.id)
     notify("Search " .. task.id .. " results ready")
     return
@@ -812,6 +1242,15 @@ local function complete_task(task, generated)
       range = explain_range,
       created_at = os.time(),
     })
+    update_task_history(task, {
+      status = "completed_explain_ready",
+      read = false,
+      explain_text = generated,
+      generated = generated,
+      range = explain_range,
+      bufnr = explain_range.bufnr,
+      bufname = vim.api.nvim_buf_get_name(explain_range.bufnr),
+    })
     remove_task(task.id)
     notify("Task " .. task.id .. " explanation ready")
     if config.explain.auto_open then
@@ -828,6 +1267,14 @@ local function complete_task(task, generated)
 
   local current_snapshot = range_text(apply_range)
   if current_snapshot ~= task.snapshot then
+    update_task_history(task, {
+      status = "stale",
+      read = false,
+      error = "selection changed",
+      range = apply_range,
+      bufnr = apply_range.bufnr,
+      bufname = vim.api.nvim_buf_get_name(apply_range.bufnr),
+    })
     remove_task(task.id)
     notify("Task " .. task.id .. " stale: selection changed", vim.log.levels.WARN)
     return
@@ -847,16 +1294,54 @@ local function complete_task(task, generated)
   remove_task(task.id)
 
   if not ok then
+    update_task_history(task, {
+      status = "failed",
+      read = false,
+      error = tostring(err),
+      range = apply_range,
+      bufnr = apply_range.bufnr,
+      bufname = vim.api.nvim_buf_get_name(apply_range.bufnr),
+    })
     notify("Task " .. task.id .. " failed to apply: " .. tostring(err), vim.log.levels.ERROR)
     return
   end
 
+  update_task_history(task, {
+    status = "completed_applied",
+    read = false,
+    generated = generated,
+    range = apply_range,
+    bufnr = apply_range.bufnr,
+    bufname = vim.api.nvim_buf_get_name(apply_range.bufnr),
+  })
+
   notify("Task " .. task.id .. " completed and applied")
 end
 
-local function fail_task(task, reason)
+local function fail_task(task, reason, status)
+  update_task_history(task, {
+    status = status or "failed",
+    read = false,
+    error = reason,
+  })
   remove_task(task.id)
-  notify("Task " .. task.id .. " failed: " .. reason, vim.log.levels.ERROR)
+  if status == "cancelled" then
+    notify("Task " .. task.id .. " cancelled")
+  else
+    notify("Task " .. task.id .. " failed: " .. reason, vim.log.levels.ERROR)
+  end
+end
+
+cancel_running_task = function(task)
+  if not task or task.status ~= "running" then
+    return
+  end
+
+  if task.proc and type(task.proc.kill) == "function" then
+    pcall(task.proc.kill, task.proc, 15)
+  end
+
+  fail_task(task, "cancelled by user", "cancelled")
 end
 
 local function request_task(task)
@@ -881,7 +1366,7 @@ local function request_task(task)
   local cmd = vim.deepcopy(config.claude_cmd)
   table.insert(cmd, prompt)
 
-  vim.system(cmd, { text = true }, function(obj)
+  task.proc = vim.system(cmd, { text = true }, function(obj)
     vim.schedule(function()
       if not state.tasks[task.id] then
         return
@@ -941,8 +1426,14 @@ local function dispatch_task(mode)
       }
 
       state.tasks[task_id] = task
+      ensure_task_history(task)
       local anchored, anchor_err = set_task_anchor(task)
       if not anchored then
+        update_task_history(task, {
+          status = "failed",
+          read = false,
+          error = anchor_err,
+        })
         state.tasks[task_id] = nil
         notify("Task " .. task_id .. " failed: " .. anchor_err, vim.log.levels.ERROR)
         return
@@ -998,6 +1489,7 @@ function M.dispatch_search_task()
     }
 
     state.tasks[task_id] = task
+    ensure_task_history(task)
     notify("Search " .. task_id .. " dispatched")
     request_task(task)
   end)
@@ -1009,12 +1501,7 @@ function M.open_latest_search_quickfix()
     notify("No search results yet", vim.log.levels.WARN)
     return
   end
-
-  vim.fn.setqflist({}, " ", {
-    title = string.format("Async AI Search #%d", latest.task_id),
-    items = latest.items,
-  })
-  vim.cmd("copen")
+  open_search_result({ id = latest.task_id, search_items = latest.items })
 end
 
 function M.list_running_tasks()
@@ -1069,6 +1556,15 @@ function M.open_explain_result_list()
   open_explain_picker()
 end
 
+function M.open_task_browser(filters)
+  open_task_browser(filters)
+end
+
+function M.open_task_browser_for_key(lhs)
+  local presets = config.keymaps and config.keymaps.task_browser or {}
+  open_task_browser(presets[lhs] or {})
+end
+
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   set_default_highlights()
@@ -1099,10 +1595,23 @@ function M.setup(opts)
       silent = true,
     })
 
-    vim.keymap.set("n", config.keymaps.list, M.list_running_tasks, {
-      desc = "async-ai: list running tasks",
-      silent = true,
-    })
+    if config.keymaps.list and config.keymaps.list ~= "" then
+      vim.keymap.set("n", config.keymaps.list, M.list_running_tasks, {
+        desc = "async-ai: list running tasks",
+        silent = true,
+      })
+    end
+
+    local browser_maps = config.keymaps.task_browser or {}
+    for lhs, filters in pairs(browser_maps) do
+      local default_filters = vim.deepcopy(filters)
+      vim.keymap.set("n", lhs, function()
+        open_task_browser(default_filters)
+      end, {
+        desc = "async-ai: open task browser",
+        silent = true,
+      })
+    end
   end
 
   if not state.commands_registered then
@@ -1133,6 +1642,12 @@ function M.setup(opts)
 
     vim.api.nvim_create_user_command("AsyncAISearchQuickfix", M.open_latest_search_quickfix, {
       desc = "Open latest async AI search results in quickfix",
+    })
+
+    vim.api.nvim_create_user_command("AsyncAITasks", function()
+      open_task_browser(config.keymaps and config.keymaps.task_browser and config.keymaps.task_browser["<leader>al"] or {})
+    end, {
+      desc = "Open async AI task browser",
     })
 
     state.commands_registered = true

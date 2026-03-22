@@ -101,6 +101,7 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 - Search results ready
 - Task marked stale (selection changed)
 - Task failed
+- Task cancelled
 
 ### In-Progress Visual Indicators
 
@@ -134,7 +135,57 @@ Suggested defaults:
 | Normal | `<leader>as`   | Open agentic search prompt and dispatch async search |
 | Normal | `<leader>aq`   | Open quickfix with latest search results |
 | Normal | `<leader>ae`   | Open explain result list        |
-| Normal | `<leader>al`   | List running tasks              |
+| Normal | `<leader>al`   | Open task browser (default filters: `COMPLETED` + `UNREAD`) |
+
+---
+
+## Task Browser (Snacks UI)
+
+Use case: inspect recent tasks in one place, quickly filter by status/type, and open results without leaving editing flow.
+
+### UI
+
+- Implement with `snacks.nvim` picker-style modal only.
+- If `snacks.nvim` is not available, show an error notification and abort opening.
+- Rows are ordered newest to oldest.
+- Keep in-memory history of the latest 200 tasks.
+
+### Filters
+
+- Filter chips are toggled with single keys inside the browser:
+  - `c` => `COMPLETED`
+  - `i` => `INPROGRESS`
+  - `u` => `UNREAD`
+  - `s` => `SEARCH`
+  - `e` => `EXPLAIN`
+  - `d` => `EDIT`
+  - `0` => clear all filters
+  - `a` => enable all filters
+- The active filter set is configurable per binding: different bindings can open the same browser with different default filters.
+- `<leader>al` must open with default filters `COMPLETED + UNREAD`.
+- If no filters are active, show all tasks (including `stale`, `failed`, `cancelled`).
+
+### Read/Unread Semantics
+
+- `UNREAD` is meaningful for completed tasks.
+- `INPROGRESS` tasks are always treated as unread.
+- Pressing `<Enter>` on a completed task marks it as read.
+- Pressing `<Enter>` on terminal error states (`stale`, `failed`, `cancelled`) marks read and shows an error/status message.
+
+### Row Actions
+
+- `<Enter>` behavior:
+  - `EXPLAIN` completed task => open explanation output
+  - `SEARCH` completed task => open quickfix with that task's results
+  - `EDIT` completed task => open diff
+  - `INPROGRESS` task => no action
+- `x` on `INPROGRESS` task asks for confirmation, then cancels task if confirmed.
+
+### Task History States
+
+- Browser history includes running and terminal tasks.
+- `COMPLETED` filter matches successful tasks only.
+- Non-success terminal tasks (`stale`, `failed`, `cancelled`) are visible when filter selection allows them (always visible when no filters are active).
 
 ---
 
