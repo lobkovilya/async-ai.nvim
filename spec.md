@@ -87,6 +87,7 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 - Claude Code CLI must be installed and available in `$PATH` as `claude`.
 - User must be authenticated with Claude Code before dispatching tasks.
 - Plugin invokes Claude Code per task; no long-running Claude Code instance is required.
+- `diffview.nvim` should be installed for default task diff UX (builtin diff fallback is used when unavailable).
 
 ### Task Lifecycle
 
@@ -191,8 +192,8 @@ Use case: inspect recent tasks in one place, quickly filter by status/type, and 
 - `<Enter>` behavior:
   - `EXPLAIN` completed task => open explanation output
   - `SEARCH` completed task => open quickfix with that task's results
-  - `EDIT` completed task => open inline diff
-  - `JOB` completed task => open per-job changed-file list + isolated patch diff (exact patch that was applied)
+  - `EDIT` completed task => open `diffview.nvim` for the target file (fallback: builtin inline diff)
+  - `JOB` completed task => open `diffview.nvim` filtered to changed files (fallback: per-job changed-file list + isolated patch diff)
   - `INPROGRESS` task => no action
 - `x` on `INPROGRESS` task asks for confirmation, then cancels task if confirmed.
 
@@ -265,6 +266,7 @@ Use case: request an explanation or other generated text about a selected scope 
 - `explain.wrap = true`
 - `explain.filetype = "markdown"`
 - `explain.auto_open = false` (default)
+- `diff.viewer = "diffview" | "builtin"` (default `diffview`)
 
 ### Accessing Ready Results
 

@@ -16,10 +16,14 @@ local state = {
     timer = nil,
     spinner_index = 1,
   },
+  diffview_configured = false,
 }
 
 local config = {
   claude_cmd = { "claude", "-p" },
+  diff = {
+    viewer = "diffview",
+  },
   job = {
     permission_mode = "bypassPermissions",
   },
@@ -638,10 +642,82 @@ local function refresh_unmodified_file_buffers()
   end
 end
 
+local function open_diffview(cwd, paths)
+  if (config.diff and config.diff.viewer or "diffview") ~= "diffview" then
+    return false
+  end
+
+  if not state.diffview_configured then
+    local ok_diffview, diffview = pcall(require, "diffview")
+    if ok_diffview and diffview and type(diffview.setup) == "function" then
+      pcall(diffview.setup, {
+        use_icons = false,
+        view = {
+          default = { disable_diagnostics = true },
+          file_history = { disable_diagnostics = true },
+          merge_tool = { disable_diagnostics = true },
+        },
+      })
+    end
+    state.diffview_configured = true
+  end
+
+  if vim.fn.exists(":DiffviewOpen") ~= 2 then
+    notify("diffview.nvim not available; falling back to builtin diff", vim.log.levels.WARN)
+    return false
+  end
+
+  local args = {}
+  if cwd and cwd ~= "" then
+    table.insert(args, "-C" .. cwd)
+  end
+
+  local valid_paths = {}
+  for _, path in ipairs(paths or {}) do
+    if type(path) == "string" and path ~= "" then
+      table.insert(valid_paths, path)
+    end
+  end
+  if #valid_paths > 0 then
+    table.insert(args, "--")
+    vim.list_extend(args, valid_paths)
+  end
+
+  local ok, err = pcall(vim.cmd, {
+    cmd = "DiffviewOpen",
+    args = args,
+  })
+  if not ok then
+    notify("failed to open diffview: " .. tostring(err), vim.log.levels.WARN)
+    return false
+  end
+
+  return true
+end
+
+local function setup_diffview_buffer_guards()
+  local group = vim.api.nvim_create_augroup("AsyncAIDiffviewGuards", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = group,
+    pattern = "diffview://*",
+    callback = function(ev)
+      pcall(vim.diagnostic.disable, ev.buf)
+      local clients = vim.lsp.get_clients({ bufnr = ev.buf })
+      for _, client in ipairs(clients) do
+        pcall(vim.lsp.buf_detach_client, ev.buf, client.id)
+      end
+    end,
+  })
+end
+
 local function open_edit_result(entry)
   if entry.mode == "job" then
     local changed_files = entry.job_diff_files or {}
     local diff_text = entry.job_diff or ""
+
+    if open_diffview(entry.job_source_cwd, changed_files) then
+      return
+    end
 
     local text = nil
     if #changed_files > 0 or diff_text ~= "" then
@@ -666,6 +742,17 @@ local function open_edit_result(entry)
       entry.generated or "",
     }, "\n")
     open_text_result(string.format("Async AI Job #%d", entry.id), text, "markdown")
+    return
+  end
+
+  local edit_paths = {}
+  if entry.bufname and entry.bufname ~= "" then
+    local path = vim.fn.fnamemodify(entry.bufname, ":.")
+    if path and path ~= "" then
+      table.insert(edit_paths, path)
+    end
+  end
+  if open_diffview(vim.fn.getcwd(), edit_paths) then
     return
   end
 
@@ -1788,6 +1875,7 @@ end
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
   set_default_highlights()
+  setup_diffview_buffer_guards()
 
   if config.keymaps and config.keymaps.enabled then
     vim.keymap.set("x", config.keymaps.inline, M.dispatch_inline_task, {
