@@ -24,17 +24,12 @@ An AI integration for Neovim where **the developer stays in charge**. AI is invo
 The primary interaction:
 
 1. **Select a scope** — visual selection. This is the task scope and the hard boundary for any edits.
-2. **Choose context** — trigger `<leader>ai` to open a picker:
-   - `No extra context` (default selected)
-   - `Whole file`
-3. **Dispatch** — after choosing context, write a prompt in a minimal input and hit enter to fire. The input prompt must include the chosen context scope (for example: `AI prompt (No extra context):` or `AI prompt (Whole file):`). Non-blocking. After dispatch is accepted, editor mode returns to Normal mode.
-4. **Task runs async** — you keep editing while the request is in flight. No lock highlight/sign is shown in MVP.
-5. **Result arrives** — task scope is tracked with moving buffer anchors, so edits above/below the scope do not invalidate it; if the selected text snapshot is unchanged, the result is auto-applied to the current anchored range and nowhere else.
-6. **Stale protection** — if the scoped content itself changed while running, apply is aborted and the task is marked stale.
+2. **Dispatch** — trigger `<leader>ai`, write a prompt in a minimal input, and hit enter to fire. The prompt label is `AI prompt:`. Non-blocking. After dispatch is accepted, editor mode returns to Normal mode.
+3. **Task runs async** — you keep editing while the request is in flight. No lock highlight/sign is shown in MVP.
+4. **Result arrives** — task scope is tracked with moving buffer anchors, so edits above/below the scope do not invalidate it; if the selected text snapshot is unchanged, the result is auto-applied to the current anchored range and nowhere else.
+5. **Stale protection** — if the scoped content itself changed while running, apply is aborted and the task is marked stale.
 
-Context is read-only. Even when `Whole file` is chosen, apply logic remains scoped to the original visual selection.
-
-The chosen context scope must be visible in dispatch notifications/messages.
+Only the selected scope is sent as inline/explain context by default.
 
 Multiple concurrent tasks on different regions are supported. Dispatch is rejected if the new selection overlaps any currently running task.
 
@@ -95,7 +90,7 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 
 ### Notifications
 
-- Dispatch accepted (must include chosen context scope)
+- Dispatch accepted
 - Dispatch rejected (overlap)
 - Task completed and applied
 - Search results ready
@@ -130,7 +125,7 @@ Suggested defaults:
 
 | Mode   | Key            | Action                          |
 |--------|----------------|---------------------------------|
-| Visual | `<leader>ai`   | Open context picker, then dispatch inline task |
+| Visual | `<leader>ai`   | Dispatch inline task |
 | Visual | `<leader>ae`   | Explain selected scope (no edit)|
 | Normal | `<leader>as`   | Open agentic search prompt and dispatch async search |
 | Normal | `<leader>aq`   | Open quickfix with latest search results |
@@ -220,12 +215,9 @@ Use case: request an explanation or other generated text about a selected scope 
 ### Behavior
 
 - Explain mode reuses the same visual scope capture and async dispatch model as inline edit tasks.
-- Explain dispatch also uses the same context picker as inline tasks:
-  - `No extra context` (default selected)
-  - `Whole file`
 - The selected code is sent as context, but no buffer text is replaced on completion.
 - While running, the same in-progress visual indicators are shown on the selected range.
-- The input prompt must include chosen context scope, and dispatch accepted notifications/messages must include chosen context scope.
+- The input prompt label is `AI prompt:`.
 
 ### Output Display (Recommended)
 

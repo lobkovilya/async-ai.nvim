@@ -54,17 +54,6 @@ local config = {
   },
 }
 
-local inline_context_options = {
-  {
-    key = "none",
-    label = "No extra context",
-  },
-  {
-    key = "whole_file",
-    label = "Whole file",
-  },
-}
-
 local filter_order = { "COMPLETED", "INPROGRESS", "UNREAD", "SEARCH", "EXPLAIN", "EDIT" }
 
 local success_statuses = {
@@ -1012,25 +1001,6 @@ local function range_text(range)
   return table.concat(text, "\n")
 end
 
-local function buffer_text(bufnr)
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  return table.concat(lines, "\n")
-end
-
-local function context_from_option(option, bufnr)
-  local selected = option or inline_context_options[1]
-  local context = {
-    key = selected.key,
-    label = selected.label,
-  }
-
-  if selected.key == "whole_file" then
-    context.text = buffer_text(bufnr)
-  end
-
-  return context
-end
-
 local function build_prompt(task)
   if task.mode == "search" then
     return table.concat({
@@ -1052,26 +1022,7 @@ local function build_prompt(task)
     }, "\n")
   end
 
-  local context = task.context or context_from_option(nil, task.range.bufnr)
-
   if task.mode == "explain" then
-    if context.key == "whole_file" then
-      return table.concat({
-        "You are explaining a selected code scope from Neovim.",
-        "Respond with a concise, helpful multiline explanation.",
-        "Use read-only whole-file context for additional understanding.",
-        "",
-        "Instruction:",
-        task.prompt,
-        "",
-        "Selection:",
-        task.snapshot,
-        "",
-        "Read-only context (whole file):",
-        context.text or "",
-      }, "\n")
-    end
-
     return table.concat({
       "You are explaining a selected code scope from Neovim.",
       "Respond with a concise, helpful multiline explanation.",
@@ -1081,24 +1032,6 @@ local function build_prompt(task)
       "",
       "Selection:",
       task.snapshot,
-    }, "\n")
-  end
-
-  if context.key == "whole_file" then
-    return table.concat({
-      "You are editing a scoped selection in Neovim.",
-      "Apply the user's instruction to the provided selection and return only replacement text.",
-      "Do not include markdown fences or explanations.",
-      "The whole-file context is read-only and must not be rewritten directly.",
-      "",
-      "Instruction:",
-      task.prompt,
-      "",
-      "Writable selection:",
-      task.snapshot,
-      "",
-      "Read-only context (whole file):",
-      context.text or "",
     }, "\n")
   end
 
@@ -1401,8 +1334,8 @@ local function dispatch_task(mode)
     return
   end
 
-  local function dispatch_with_context(context)
-    vim.ui.input({ prompt = "AI prompt (" .. context.label .. "): " }, function(user_prompt)
+  local function dispatch()
+    vim.ui.input({ prompt = "AI prompt: " }, function(user_prompt)
       if not user_prompt or vim.trim(user_prompt) == "" then
         return
       end
@@ -1422,7 +1355,6 @@ local function dispatch_task(mode)
         range = range,
         snapshot = range_text(range),
         prompt = user_prompt,
-        context = context,
       }
 
       state.tasks[task_id] = task
@@ -1442,26 +1374,15 @@ local function dispatch_task(mode)
       add_task_indicators(task)
       leave_visual_mode()
       if mode == "explain" then
-        notify("Task " .. task_id .. " explain dispatched (" .. context.label .. ")")
+        notify("Task " .. task_id .. " explain dispatched")
       else
-        notify("Task " .. task_id .. " dispatched (" .. context.label .. ")")
+        notify("Task " .. task_id .. " dispatched")
       end
       request_task(task)
     end)
   end
 
-  vim.ui.select(inline_context_options, {
-    prompt = "Context scope",
-    format_item = function(item)
-      return item.label
-    end,
-  }, function(option)
-    if not option then
-      return
-    end
-
-    dispatch_with_context(context_from_option(option, bufnr))
-  end)
+  dispatch()
 end
 
 function M.dispatch_inline_task()
