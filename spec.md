@@ -29,8 +29,8 @@ The primary interaction:
    - `Whole file`
 3. **Dispatch** — after choosing context, write a prompt in a minimal input and hit enter to fire. The input prompt must include the chosen context scope (for example: `AI prompt (No extra context):` or `AI prompt (Whole file):`). Non-blocking. After dispatch is accepted, editor mode returns to Normal mode.
 4. **Task runs async** — you keep editing while the request is in flight. No lock highlight/sign is shown in MVP.
-5. **Result arrives** — if the selected text snapshot is unchanged, the result is auto-applied to that original selected range and nowhere else.
-6. **Stale protection** — if selection content changed while running, apply is aborted and the task is marked stale.
+5. **Result arrives** — task scope is tracked with moving buffer anchors, so edits above/below the scope do not invalidate it; if the selected text snapshot is unchanged, the result is auto-applied to the current anchored range and nowhere else.
+6. **Stale protection** — if the scoped content itself changed while running, apply is aborted and the task is marked stale.
 
 Context is read-only. Even when `Whole file` is chosen, apply logic remains scoped to the original visual selection.
 
@@ -54,9 +54,11 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 
 ## Scope Enforcement
 
-- Apply logic mechanically enforces the boundary — result is spliced into the original selection range, no file-level rewrites.
+- Apply logic mechanically enforces the boundary — result is spliced into the current anchored scope that represents the original selection, no file-level rewrites.
 - AI never creates new files or touches anything outside the dispatched scope.
-- Before apply, current selection content is compared against the dispatch-time snapshot; mismatch means stale task and no write.
+- Before apply, current anchored scope content is compared against the dispatch-time snapshot; mismatch means stale task and no write.
+- Scope anchors move with buffer edits, so unrelated line inserts/deletes outside the scope do not trigger stale failures.
+- Boundary inserts are treated as outside the original scope (insert at start stays before, insert at end stays after).
 
 ---
 

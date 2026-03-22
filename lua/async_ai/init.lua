@@ -261,6 +261,66 @@ local function get_namespace()
   return state.ui.ns
 end
 
+local function set_task_anchor(task)
+  if not task.range then
+    return true
+  end
+
+  local range = task.range
+  if not vim.api.nvim_buf_is_valid(range.bufnr) then
+    return false, "Task buffer is no longer valid"
+  end
+
+  local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, range.bufnr, get_namespace(), range.start_row, range.start_col, {
+    end_row = range.end_row,
+    end_col = range.end_col,
+    right_gravity = true,
+    end_right_gravity = false,
+  })
+
+  if not ok or not mark_id then
+    return false, "Failed to anchor task range"
+  end
+
+  task.anchor_bufnr = range.bufnr
+  task.anchor_mark_id = mark_id
+  return true
+end
+
+local function resolve_task_range(task)
+  if not task or not task.anchor_bufnr or not task.anchor_mark_id then
+    return nil
+  end
+
+  if not vim.api.nvim_buf_is_valid(task.anchor_bufnr) then
+    return nil
+  end
+
+  local mark = vim.api.nvim_buf_get_extmark_by_id(task.anchor_bufnr, get_namespace(), task.anchor_mark_id, {
+    details = true,
+  })
+  if type(mark) ~= "table" or type(mark[1]) ~= "number" or type(mark[2]) ~= "number" then
+    return nil
+  end
+
+  local details = mark[3]
+  if type(details) ~= "table" or type(details.end_row) ~= "number" or type(details.end_col) ~= "number" then
+    return nil
+  end
+
+  return {
+    bufnr = task.anchor_bufnr,
+    start_row = mark[1],
+    start_col = mark[2],
+    end_row = details.end_row,
+    end_col = details.end_col,
+  }
+end
+
+local function task_runtime_range(task)
+  return resolve_task_range(task) or task.range
+end
+
 local function set_default_highlights()
   if not config.ui or not config.ui.enabled then
     return
@@ -291,11 +351,16 @@ local function upsert_task_label(task, frame)
     return
   end
 
-  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+  local range = task_runtime_range(task)
+  if not range then
     return
   end
 
-  local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, task.range.bufnr, get_namespace(), task.range.start_row, 0, {
+  if not vim.api.nvim_buf_is_valid(range.bufnr) then
+    return
+  end
+
+  local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, range.bufnr, get_namespace(), range.start_row, 0, {
     id = task.ui_label_mark_id,
     virt_lines = {
       {
@@ -315,26 +380,33 @@ local function clear_task_indicators(task)
     return
   end
 
-  if not task.range then
-    return
+  if task.anchor_mark_id and task.anchor_bufnr and vim.api.nvim_buf_is_valid(task.anchor_bufnr) then
+    pcall(vim.api.nvim_buf_del_extmark, task.anchor_bufnr, get_namespace(), task.anchor_mark_id)
+    task.anchor_mark_id = nil
+    task.anchor_bufnr = nil
   end
 
   if not config.ui or not config.ui.enabled then
     return
   end
 
-  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+  local range = task_runtime_range(task)
+  if not range then
+    return
+  end
+
+  if not vim.api.nvim_buf_is_valid(range.bufnr) then
     return
   end
 
   local ns = get_namespace()
   if task.ui_range_mark_id then
-    pcall(vim.api.nvim_buf_del_extmark, task.range.bufnr, ns, task.ui_range_mark_id)
+    pcall(vim.api.nvim_buf_del_extmark, range.bufnr, ns, task.ui_range_mark_id)
     task.ui_range_mark_id = nil
   end
 
   if task.ui_label_mark_id then
-    pcall(vim.api.nvim_buf_del_extmark, task.range.bufnr, ns, task.ui_label_mark_id)
+    pcall(vim.api.nvim_buf_del_extmark, range.bufnr, ns, task.ui_label_mark_id)
     task.ui_label_mark_id = nil
   end
 end
@@ -418,13 +490,18 @@ local function add_task_indicators(task)
     return
   end
 
-  if not vim.api.nvim_buf_is_valid(task.range.bufnr) then
+  local range = task_runtime_range(task)
+  if not range then
     return
   end
 
-  local ok, range_mark_id = pcall(vim.api.nvim_buf_set_extmark, task.range.bufnr, get_namespace(), task.range.start_row, task.range.start_col, {
-    end_row = task.range.end_row,
-    end_col = task.range.end_col,
+  if not vim.api.nvim_buf_is_valid(range.bufnr) then
+    return
+  end
+
+  local ok, range_mark_id = pcall(vim.api.nvim_buf_set_extmark, range.bufnr, get_namespace(), range.start_row, range.start_col, {
+    end_row = range.end_row,
+    end_col = range.end_col,
     hl_group = config.ui.range_hl_group,
     hl_mode = "combine",
   })
@@ -619,7 +696,8 @@ end
 
 local function selection_overlaps_running_task(range)
   for _, existing in pairs(state.tasks) do
-    if existing.status == "running" and ranges_overlap(existing.range, range) then
+    local existing_range = task_runtime_range(existing)
+    if existing.status == "running" and existing_range and ranges_overlap(existing_range, range) then
       return true
     end
   end
@@ -719,13 +797,19 @@ local function complete_task(task, generated)
   end
 
   if task.mode == "explain" then
+    local explain_range = task_runtime_range(task)
+    if not explain_range then
+      fail_task(task, "Task range was lost")
+      return
+    end
+
     push_explain_result({
       task_id = task.id,
       prompt = task.prompt,
       text = generated,
-      bufnr = task.range.bufnr,
-      bufname = vim.api.nvim_buf_get_name(task.range.bufnr),
-      range = task.range,
+      bufnr = explain_range.bufnr,
+      bufname = vim.api.nvim_buf_get_name(explain_range.bufnr),
+      range = explain_range,
       created_at = os.time(),
     })
     remove_task(task.id)
@@ -736,7 +820,13 @@ local function complete_task(task, generated)
     return
   end
 
-  local current_snapshot = range_text(task.range)
+  local apply_range = task_runtime_range(task)
+  if not apply_range then
+    fail_task(task, "Task range was lost")
+    return
+  end
+
+  local current_snapshot = range_text(apply_range)
   if current_snapshot ~= task.snapshot then
     remove_task(task.id)
     notify("Task " .. task.id .. " stale: selection changed", vim.log.levels.WARN)
@@ -745,11 +835,11 @@ local function complete_task(task, generated)
 
   local ok, err = pcall(function()
     vim.api.nvim_buf_set_text(
-      task.range.bufnr,
-      task.range.start_row,
-      task.range.start_col,
-      task.range.end_row,
-      task.range.end_col,
+      apply_range.bufnr,
+      apply_range.start_row,
+      apply_range.start_col,
+      apply_range.end_row,
+      apply_range.end_col,
       split_lines(generated)
     )
   end)
@@ -851,6 +941,13 @@ local function dispatch_task(mode)
       }
 
       state.tasks[task_id] = task
+      local anchored, anchor_err = set_task_anchor(task)
+      if not anchored then
+        state.tasks[task_id] = nil
+        notify("Task " .. task_id .. " failed: " .. anchor_err, vim.log.levels.ERROR)
+        return
+      end
+
       add_task_indicators(task)
       leave_visual_mode()
       if mode == "explain" then
@@ -926,28 +1023,31 @@ function M.list_running_tasks()
     if task.status == "running" then
       if task.mode == "search" then
         table.insert(lines, string.format("#%d [search] %s", id, task.prompt))
-      elseif task.range then
-        local name = vim.api.nvim_buf_get_name(task.range.bufnr)
-        if name == "" then
-          name = "[No Name]"
-        else
-          name = vim.fn.fnamemodify(name, ":~:.")
-        end
-
-        table.insert(
-          lines,
-          string.format(
-            "#%d %s (%d:%d -> %d:%d)",
-            id,
-            name,
-            task.range.start_row + 1,
-            task.range.start_col + 1,
-            task.range.end_row + 1,
-            task.range.end_col + 1
-          )
-        )
       else
-        table.insert(lines, string.format("#%d [task] running", id))
+        local runtime_range = task_runtime_range(task)
+        if not runtime_range then
+          table.insert(lines, string.format("#%d [task] running", id))
+        else
+          local name = vim.api.nvim_buf_get_name(runtime_range.bufnr)
+          if name == "" then
+            name = "[No Name]"
+          else
+            name = vim.fn.fnamemodify(name, ":~:.")
+          end
+
+          table.insert(
+            lines,
+            string.format(
+              "#%d %s (%d:%d -> %d:%d)",
+              id,
+              name,
+              runtime_range.start_row + 1,
+              runtime_range.start_col + 1,
+              runtime_range.end_row + 1,
+              runtime_range.end_col + 1
+            )
+          )
+        end
       end
     end
   end
