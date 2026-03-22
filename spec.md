@@ -9,7 +9,7 @@ An AI integration for Neovim where **the developer stays in charge**. AI is invo
 ## Core Principles
 
 - **You drive, AI assists** — not the other way around
-- **Scoped writes** — AI can only modify the region you explicitly selected
+- **Scoped writes by default** — inline edits are limited to the region you explicitly selected
 - **Non-blocking** — dispatching a task never pauses your editing
 - **Claude Code transport only** — requests are executed through the local Claude Code CLI
 - **Single provider** — no direct Anthropic HTTP integration in this plugin
@@ -33,6 +33,20 @@ Only the selected scope is sent as inline/explain context by default.
 
 Multiple concurrent tasks on different regions are supported. Dispatch is rejected if the new selection overlaps any currently running task.
 
+### Agentic Job Task (Repo-Wide Edits)
+
+Use case: start from a visual selection as focus, but let Claude Code modify any files in the current working directory.
+
+1. **Select a focus scope** — visual selection provides local context for the job request.
+2. **Dispatch** — trigger `<leader>aj`, enter a prompt, and dispatch asynchronously.
+3. **Task runs async** — same in-progress visuals and overlap rejection behavior as other visual tasks. Isolated workspace preparation is asynchronous and must not block editing.
+4. **Isolated execution** — Claude Code runs in an isolated workspace copy, so your real working tree is not modified while the job is running.
+5. **Result arrives** — plugin computes a pure job patch from isolated baseline vs isolated final state, validates it, then applies it to the real working tree atomically.
+6. **Buffer refresh** — after apply, unmodified file buffers are refreshed from disk so open windows reflect job changes immediately.
+
+Job mode is intentionally not scope-limited for writes; it is the explicit "agentic repo edit" mode.
+By default, job dispatch runs Claude Code with permission mode `bypassPermissions` so non-interactive writes are not blocked by approval prompts.
+
 ### Agentic Search Task
 
 Use case: ask Claude Code to investigate the codebase and return actionable search hits, not just a single generated `rg` command.
@@ -49,11 +63,12 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 
 ## Scope Enforcement
 
-- Apply logic mechanically enforces the boundary — result is spliced into the current anchored scope that represents the original selection, no file-level rewrites.
-- AI never creates new files or touches anything outside the dispatched scope.
-- Before apply, current anchored scope content is compared against the dispatch-time snapshot; mismatch means stale task and no write.
+- Inline edit mode (`<leader>ai`) mechanically enforces the boundary — result is spliced into the current anchored scope that represents the original selection, no file-level rewrites.
+- In inline edit mode, AI never creates new files or touches anything outside the dispatched scope.
+- In inline edit mode, before apply, current anchored scope content is compared against the dispatch-time snapshot; mismatch means stale task and no write.
 - Scope anchors move with buffer edits, so unrelated line inserts/deletes outside the scope do not trigger stale failures.
 - Boundary inserts are treated as outside the original scope (insert at start stays before, insert at end stays after).
+- Job mode (`<leader>aj`) is the explicit exception: writes may occur anywhere in the current working directory.
 
 ---
 
@@ -77,6 +92,7 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 
 - `running` — request is in flight
 - `completed_applied` — response received and auto-applied to original selection
+- `completed_job_done` — repo-wide job completed and isolated patch applied
 - `completed_search_ready` — search response parsed and stored as latest quickfix payload
 - `stale` — selection content changed since dispatch; response not applied
 - `failed` — request error/invalid response
@@ -92,7 +108,8 @@ Search is non-modifying: it never writes to buffers/files and never applies inli
 
 - Dispatch accepted
 - Dispatch rejected (overlap)
-- Task completed and applied
+- Task completed and applied (inline edit)
+- Job completed
 - Search results ready
 - Task marked stale (selection changed)
 - Task failed
@@ -126,6 +143,7 @@ Suggested defaults:
 | Mode   | Key            | Action                          |
 |--------|----------------|---------------------------------|
 | Visual | `<leader>ai`   | Dispatch inline task |
+| Visual | `<leader>aj`   | Dispatch repo-wide job task (selection provides focus context) |
 | Visual | `<leader>ae`   | Explain selected scope (no edit)|
 | Normal | `<leader>as`   | Open agentic search prompt and dispatch async search |
 | Normal | `<leader>aq`   | Open quickfix with latest search results |
@@ -154,6 +172,7 @@ Use case: inspect recent tasks in one place, quickly filter by status/type, and 
   - `s` => `SEARCH`
   - `e` => `EXPLAIN`
   - `d` => `EDIT`
+  - `j` => `JOB`
   - `0` => clear all filters
   - `a` => enable all filters
 - The active filter set is configurable per binding: different bindings can open the same browser with different default filters.
@@ -172,7 +191,8 @@ Use case: inspect recent tasks in one place, quickly filter by status/type, and 
 - `<Enter>` behavior:
   - `EXPLAIN` completed task => open explanation output
   - `SEARCH` completed task => open quickfix with that task's results
-  - `EDIT` completed task => open diff
+  - `EDIT` completed task => open inline diff
+  - `JOB` completed task => open per-job changed-file list + isolated patch diff (exact patch that was applied)
   - `INPROGRESS` task => no action
 - `x` on `INPROGRESS` task asks for confirmation, then cancels task if confirmed.
 

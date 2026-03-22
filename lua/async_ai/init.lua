@@ -20,9 +20,13 @@ local state = {
 
 local config = {
   claude_cmd = { "claude", "-p" },
+  job = {
+    permission_mode = "bypassPermissions",
+  },
   keymaps = {
     enabled = true,
     inline = "<leader>ai",
+    job = "<leader>aj",
     explain_dispatch = "<leader>ae",
     explain_open = "<leader>ae",
     search_dispatch = "<leader>as",
@@ -54,16 +58,18 @@ local config = {
   },
 }
 
-local filter_order = { "COMPLETED", "INPROGRESS", "UNREAD", "SEARCH", "EXPLAIN", "EDIT" }
+local filter_order = { "COMPLETED", "INPROGRESS", "UNREAD", "SEARCH", "EXPLAIN", "EDIT", "JOB" }
 
 local success_statuses = {
   completed_applied = true,
+  completed_job_done = true,
   completed_explain_ready = true,
   completed_search_ready = true,
 }
 
 local terminal_statuses = {
   completed_applied = true,
+  completed_job_done = true,
   completed_explain_ready = true,
   completed_search_ready = true,
   stale = true,
@@ -79,6 +85,9 @@ local function task_kind(mode)
   end
   if mode == "explain" then
     return "EXPLAIN"
+  end
+  if mode == "job" then
+    return "JOB"
   end
   return "EDIT"
 end
@@ -394,7 +403,7 @@ local function matches_filters(entry, active)
   end
 
   local type_match = true
-  local has_type_filter = active.SEARCH or active.EXPLAIN or active.EDIT
+  local has_type_filter = active.SEARCH or active.EXPLAIN or active.EDIT or active.JOB
   if has_type_filter then
     type_match = active[entry.kind] == true
   end
@@ -465,6 +474,12 @@ local function open_text_result(title, text, filetype)
   vim.bo[buf].modifiable = true
   vim.bo[buf].filetype = filetype or "markdown"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  if (filetype or "markdown") == "diff" then
+    pcall(vim.api.nvim_buf_call, buf, function()
+      vim.cmd("silent! syntax enable")
+      vim.cmd("silent! setlocal syntax=diff")
+    end)
+  end
   vim.bo[buf].modifiable = false
 
   local win = vim.api.nvim_open_win(buf, true, {
@@ -478,7 +493,7 @@ local function open_text_result(title, text, filetype)
     title = title,
   })
 
-  vim.wo[win].wrap = true
+  vim.wo[win].wrap = (filetype or "markdown") ~= "diff"
   vim.keymap.set("n", "q", function()
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
@@ -486,7 +501,174 @@ local function open_text_result(title, text, filetype)
   end, { buffer = buf, silent = true, nowait = true })
 end
 
+local function split_nonempty_lines(text)
+  return vim.split(text or "", "\n", { plain = true, trimempty = true })
+end
+
+local function write_workspace_tree(cwd)
+  local add_obj = vim.system({ "git", "add", "-A", "--", "." }, {
+    text = true,
+    cwd = cwd,
+  }):wait()
+  if add_obj.code ~= 0 then
+    return nil, vim.trim(add_obj.stderr or "git add failed")
+  end
+
+  local write_tree = vim.system({ "git", "write-tree" }, {
+    text = true,
+    cwd = cwd,
+  }):wait()
+  if write_tree.code ~= 0 then
+    return nil, vim.trim(write_tree.stderr or "git write-tree failed")
+  end
+
+  local tree = vim.trim(write_tree.stdout or "")
+  if tree == "" then
+    return nil, "empty tree hash"
+  end
+  return tree, nil
+end
+
+local function create_isolated_job_workspace_async(source_cwd, callback)
+  local isolated_dir = vim.fn.tempname()
+  vim.fn.mkdir(isolated_dir, "p")
+
+  local script = table.concat({
+    "set -euo pipefail",
+    "src=\"$1\"",
+    "dst=\"$2\"",
+    "cd \"$src\"",
+    "git ls-files -co --exclude-standard -z | while IFS= read -r -d '' rel; do",
+    "  mkdir -p \"$dst/$(dirname \"$rel\")\"",
+    "  cp -p \"$src/$rel\" \"$dst/$rel\"",
+    "done",
+    "cd \"$dst\"",
+    "git init -q",
+    "git add -A -- .",
+    "git write-tree",
+  }, "\n")
+
+  vim.system({ "bash", "-lc", script, "async-ai-job", source_cwd, isolated_dir }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        vim.fn.delete(isolated_dir, "rf")
+        local reason = vim.trim(obj.stderr or "")
+        if reason == "" then
+          reason = "failed to prepare isolated job workspace"
+        end
+        callback(nil, nil, reason)
+        return
+      end
+
+      local baseline_tree = vim.trim(obj.stdout or "")
+      if baseline_tree == "" then
+        vim.fn.delete(isolated_dir, "rf")
+        callback(nil, nil, "isolated workspace baseline tree is empty")
+        return
+      end
+
+      callback(isolated_dir, baseline_tree, nil)
+    end)
+  end)
+end
+
+local function diff_workspace_trees(cwd, before_tree, after_tree)
+  if not before_tree or before_tree == "" or not after_tree or after_tree == "" then
+    return nil, nil
+  end
+
+  if before_tree == after_tree then
+    return "", {}
+  end
+
+  local diff_obj = vim.system({ "git", "diff", "--binary", "--no-color", before_tree, after_tree }, {
+    text = true,
+    cwd = cwd,
+  }):wait()
+  local names_obj = vim.system({ "git", "diff", "--name-only", before_tree, after_tree }, {
+    text = true,
+    cwd = cwd,
+  }):wait()
+
+  if diff_obj.code ~= 0 or names_obj.code ~= 0 then
+    return nil, nil
+  end
+
+  return diff_obj.stdout or "", split_nonempty_lines(names_obj.stdout)
+end
+
+local function apply_job_patch(cwd, patch_text)
+  if not patch_text or patch_text == "" then
+    return true, nil
+  end
+
+  local check_obj = vim.system({ "git", "apply", "--check", "--binary", "--whitespace=nowarn", "-" }, {
+    text = true,
+    cwd = cwd,
+    stdin = patch_text,
+  }):wait()
+  if check_obj.code ~= 0 then
+    return false, vim.trim(check_obj.stderr or "git apply --check failed")
+  end
+
+  local apply_obj = vim.system({ "git", "apply", "--binary", "--whitespace=nowarn", "-" }, {
+    text = true,
+    cwd = cwd,
+    stdin = patch_text,
+  }):wait()
+  if apply_obj.code ~= 0 then
+    return false, vim.trim(apply_obj.stderr or "git apply failed")
+  end
+
+  return true, nil
+end
+
+local function refresh_unmodified_file_buffers()
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+      if vim.bo[bufnr].buftype == "" and not vim.bo[bufnr].modified then
+        local name = vim.api.nvim_buf_get_name(bufnr)
+        if name ~= "" then
+          pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("silent! checktime")
+          end)
+        end
+      end
+    end
+  end
+end
+
 local function open_edit_result(entry)
+  if entry.mode == "job" then
+    local changed_files = entry.job_diff_files or {}
+    local diff_text = entry.job_diff or ""
+
+    local text = nil
+    if #changed_files > 0 or diff_text ~= "" then
+      text = table.concat({
+        "Changed files:",
+        (#changed_files > 0 and table.concat(changed_files, "\n") or "(none)"),
+        "",
+        "Diff:",
+        (diff_text ~= "" and diff_text or "(empty diff output)"),
+      }, "\n")
+      open_text_result(string.format("Async AI Job #%d", entry.id), text, "diff")
+      return
+    end
+
+    text = table.concat({
+      "No isolated diff captured for this job.",
+      "",
+      "Instruction:",
+      entry.prompt or "",
+      "",
+      "Job result:",
+      entry.generated or "",
+    }, "\n")
+    open_text_result(string.format("Async AI Job #%d", entry.id), text, "markdown")
+    return
+  end
+
   local before = entry.snapshot or ""
   local after = entry.generated or ""
   local text = nil
@@ -551,7 +733,7 @@ local function open_task_history_entry(entry)
     return true
   end
 
-  if entry.kind == "EDIT" and success_statuses[entry.status] then
+  if (entry.kind == "EDIT" or entry.kind == "JOB") and success_statuses[entry.status] then
     open_edit_result(entry)
     return true
   end
@@ -644,6 +826,7 @@ local function open_task_browser(default_filters)
       toggle_search = toggle("SEARCH"),
       toggle_explain = toggle("EXPLAIN"),
       toggle_edit = toggle("EDIT"),
+      toggle_job = toggle("JOB"),
       clear_filters = clear_all,
       cancel_task = cancel_selected,
     },
@@ -656,6 +839,7 @@ local function open_task_browser(default_filters)
           ["s"] = "toggle_search",
           ["e"] = "toggle_explain",
           ["d"] = "toggle_edit",
+          ["j"] = "toggle_job",
           ["0"] = "clear_filters",
           ["x"] = "cancel_task",
         },
@@ -1035,6 +1219,23 @@ local function build_prompt(task)
     }, "\n")
   end
 
+  if task.mode == "job" then
+    return table.concat({
+      "You are running an agentic repository edit task from Neovim via Claude Code CLI.",
+      "You are executing inside an isolated workspace copy.",
+      "Use the selected snippet as focus context, but you may read and modify files anywhere in this workspace.",
+      "Apply the user's instruction directly by editing repository files when needed.",
+      "Do not output patches or full file contents.",
+      "When done, return a concise plain-text summary of what you changed.",
+      "",
+      "Instruction:",
+      task.prompt,
+      "",
+      "Focus selection:",
+      task.snapshot,
+    }, "\n")
+  end
+
   return table.concat({
     "You are editing a scoped selection in Neovim.",
     "Apply the user's instruction to the provided selection and return only replacement text.",
@@ -1062,6 +1263,10 @@ local function remove_task(task_id)
   local task = state.tasks[task_id]
   if task then
     task.proc = nil
+    if task.job_isolated_dir and task.job_isolated_dir ~= "" then
+      vim.fn.delete(task.job_isolated_dir, "rf")
+      task.job_isolated_dir = nil
+    end
   end
   clear_task_indicators(task)
   state.tasks[task_id] = nil
@@ -1156,6 +1361,54 @@ local function complete_task(task, generated)
     })
     remove_task(task.id)
     notify("Search " .. task.id .. " results ready")
+    return
+  end
+
+  if task.mode == "job" then
+    local job_range = task_runtime_range(task)
+    local isolated_dir = task.job_isolated_dir
+    local source_cwd = task.job_source_cwd or vim.fn.getcwd()
+
+    if not isolated_dir or isolated_dir == "" then
+      fail_task(task, "Missing isolated workspace for job task")
+      return
+    end
+
+    local job_tree_after, tree_err = write_workspace_tree(isolated_dir)
+    if not job_tree_after then
+      fail_task(task, "Failed to snapshot isolated workspace: " .. (tree_err or "unknown error"))
+      return
+    end
+
+    local job_diff, job_diff_files = diff_workspace_trees(isolated_dir, task.job_tree_before, job_tree_after)
+    if job_diff == nil or job_diff_files == nil then
+      fail_task(task, "Failed to generate isolated diff for job task")
+      return
+    end
+
+    local applied, apply_err = apply_job_patch(source_cwd, job_diff)
+    if not applied then
+      fail_task(task, "Failed to apply job patch atomically: " .. (apply_err or "unknown error"))
+      return
+    end
+
+    refresh_unmodified_file_buffers()
+
+    update_task_history(task, {
+      status = "completed_job_done",
+      read = false,
+      generated = generated,
+      job_diff = job_diff,
+      job_diff_files = job_diff_files,
+      job_tree_before = task.job_tree_before,
+      job_tree_after = job_tree_after,
+      job_source_cwd = source_cwd,
+      range = job_range,
+      bufnr = job_range and job_range.bufnr or nil,
+      bufname = job_range and vim.api.nvim_buf_get_name(job_range.bufnr) or nil,
+    })
+    remove_task(task.id)
+    notify("Task " .. task.id .. " job completed")
     return
   end
 
@@ -1297,9 +1550,23 @@ local function request_task(task)
   local prompt = build_prompt(task)
 
   local cmd = vim.deepcopy(config.claude_cmd)
+
+  if task.mode == "job" then
+    local permission_mode = config.job and config.job.permission_mode or "bypassPermissions"
+    if type(permission_mode) == "string" and permission_mode ~= "" then
+      table.insert(cmd, "--permission-mode")
+      table.insert(cmd, permission_mode)
+    end
+  end
+
   table.insert(cmd, prompt)
 
-  task.proc = vim.system(cmd, { text = true }, function(obj)
+  local system_opts = { text = true }
+  if task.mode == "job" and task.job_isolated_dir and task.job_isolated_dir ~= "" then
+    system_opts.cwd = task.job_isolated_dir
+  end
+
+  task.proc = vim.system(cmd, system_opts, function(obj)
     vim.schedule(function()
       if not state.tasks[task.id] then
         return
@@ -1357,6 +1624,10 @@ local function dispatch_task(mode)
         prompt = user_prompt,
       }
 
+      if mode == "job" then
+        task.job_source_cwd = vim.fn.getcwd()
+      end
+
       state.tasks[task_id] = task
       ensure_task_history(task)
       local anchored, anchor_err = set_task_anchor(task)
@@ -1375,10 +1646,34 @@ local function dispatch_task(mode)
       leave_visual_mode()
       if mode == "explain" then
         notify("Task " .. task_id .. " explain dispatched")
+      elseif mode == "job" then
+        notify("Task " .. task_id .. " job dispatched (preparing isolated workspace)")
       else
         notify("Task " .. task_id .. " dispatched")
       end
-      request_task(task)
+
+      if mode == "job" then
+        create_isolated_job_workspace_async(task.job_source_cwd, function(isolated_dir, baseline_tree, job_err)
+          local current = state.tasks[task_id]
+          if not current then
+            if isolated_dir and isolated_dir ~= "" then
+              vim.fn.delete(isolated_dir, "rf")
+            end
+            return
+          end
+
+          if not isolated_dir then
+            fail_task(current, job_err or "failed to prepare isolated job workspace")
+            return
+          end
+
+          current.job_isolated_dir = isolated_dir
+          current.job_tree_before = baseline_tree
+          request_task(current)
+        end)
+      else
+        request_task(task)
+      end
     end)
   end
 
@@ -1387,6 +1682,10 @@ end
 
 function M.dispatch_inline_task()
   dispatch_task("inline")
+end
+
+function M.dispatch_job_task()
+  dispatch_task("job")
 end
 
 function M.dispatch_explain_task()
@@ -1496,6 +1795,13 @@ function M.setup(opts)
       silent = true,
     })
 
+    if config.keymaps.job and config.keymaps.job ~= "" then
+      vim.keymap.set("x", config.keymaps.job, M.dispatch_job_task, {
+        desc = "async-ai: dispatch job task",
+        silent = true,
+      })
+    end
+
     vim.keymap.set("x", config.keymaps.explain_dispatch, M.dispatch_explain_task, {
       desc = "async-ai: dispatch explain task",
       silent = true,
@@ -1546,6 +1852,11 @@ function M.setup(opts)
 
     vim.api.nvim_create_user_command("AsyncAIExplain", M.dispatch_explain_task, {
       desc = "Dispatch explain task for current visual selection",
+      range = true,
+    })
+
+    vim.api.nvim_create_user_command("AsyncAIJob", M.dispatch_job_task, {
+      desc = "Dispatch async AI job task from current visual selection",
       range = true,
     })
 
